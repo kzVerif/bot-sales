@@ -39,7 +39,7 @@ const PRODUCTS_FILE = "products.json";
 const STATS_FILE = "stats.json";
 
 // ---- UI / branding config (edit freely, this is display only) ----
-const SHOP_TITLE = "CRAZY STORE | ONLINE 24/7";
+const SHOP_TITLE = "ซื้อสินค้าออโต้ | ONLINE 24/7";
 const SHOP_DESCRIPTION = "เลือกสินค้าที่ต้องการและชำระเงินได้เลย \n รองรับการชำระผ่านทรูมันนี้วอลเลทเท่านั้น";
 const SHOP_COLOR = 0x000000; // soft pink-purple, matches the pastel banner look
 // Put your own banner artwork here (same folder as the bot script).
