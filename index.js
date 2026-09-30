@@ -48,6 +48,10 @@ const BANNER_PATH = "assets/banner.png";
 const BANNER_FILENAME = "banner.png";
 const LOGO_PATH = "assets/logo.png";
 const LOGO_FILENAME = "logo.png";
+const BANNER2_PATH = "assets/banner2.png";
+const BANNER2_FILENAME = "banner2.png";
+const LOGO2_PATH = "assets/logo2.png";
+const LOGO2_FILENAME = "logo2.png";
 
 // Headers ที่แนบตอนยิง API เบิกซอง TrueMoney
 const TRUEMONEY_HEADERS = {
@@ -312,23 +316,34 @@ export const TrueMoneyAPI = {
 // 3b. Shared embed helpers (UI/UX layer only)
 // ==========================================
 /** Main shop panel embed — title + short instruction, big banner image, footer sold counter. */
-function makeShopEmbed(totalSold) {
+function makeShopEmbed(totalSold, variant = "default") {
+  const isSecond = variant === "second";
+  const bannerPath = isSecond ? BANNER2_PATH : BANNER_PATH;
+  const bannerFilename = isSecond ? BANNER2_FILENAME : BANNER_FILENAME;
+  const logoPath = isSecond ? LOGO2_PATH : LOGO_PATH;
+  const logoFilename = isSecond ? LOGO2_FILENAME : LOGO_FILENAME;
   const embed = new EmbedBuilder().setTitle(SHOP_TITLE).setDescription(SHOP_DESCRIPTION).setColor(SHOP_COLOR);
-  if (existsSync(BANNER_PATH)) embed.setImage(`attachment://${BANNER_FILENAME}`);
-  if (existsSync(LOGO_PATH)) embed.setThumbnail(`attachment://${LOGO_FILENAME}`);
+  if (existsSync(bannerPath)) embed.setImage(`attachment://${bannerFilename}`);
+  if (existsSync(logoPath)) embed.setThumbnail(`attachment://${logoFilename}`);
   embed.setFooter({ text: `ขายของไปแล้ว : ${totalSold} ชิ้น` });
   return embed;
 }
 
 /** Returns a fresh attachment for the banner, or null if not set up yet. */
-function getBannerFile() {
-  if (existsSync(BANNER_PATH)) return new AttachmentBuilder(BANNER_PATH, { name: BANNER_FILENAME });
+function getBannerFile(variant = "default") {
+  const isSecond = variant === "second";
+  const bannerPath = isSecond ? BANNER2_PATH : BANNER_PATH;
+  const bannerFilename = isSecond ? BANNER2_FILENAME : BANNER_FILENAME;
+  if (existsSync(bannerPath)) return new AttachmentBuilder(bannerPath, { name: bannerFilename });
   return null;
 }
 
 /** Returns a fresh attachment for the shop logo, or null if not set up yet. */
-function getLogoFile() {
-  if (existsSync(LOGO_PATH)) return new AttachmentBuilder(LOGO_PATH, { name: LOGO_FILENAME });
+function getLogoFile(variant = "default") {
+  const isSecond = variant === "second";
+  const logoPath = isSecond ? LOGO2_PATH : LOGO_PATH;
+  const logoFilename = isSecond ? LOGO2_FILENAME : LOGO_FILENAME;
+  if (existsSync(logoPath)) return new AttachmentBuilder(logoPath, { name: logoFilename });
   return null;
 }
 
@@ -445,12 +460,13 @@ async function notifyOwnerInsufficientPayment(client, buyer, productName, quanti
 // 4. Discord UI Components
 // ==========================================
 const SELECT_ID = "shop_select";
+const SELECT_ID_2 = "shop_select_2";
 const CLEAR_SELECTION_ID = "shop_clear_selection";
 const RELOAD_ID = "reload_shop";
 const MODAL_PREFIX = "purchase:";
 
 /** สร้างแผง dropdown เลือกสินค้า + ปุ่มรีเฟรช (เทียบเท่า build_shop_view) */
-async function buildShopComponents(products, stockManager) {
+async function buildShopComponents(products, stockManager, variant = "default") {
   // กันไว้ 1 ช่องสำหรับตัวเลือก "ล้างตัวเลือก" (Discord จำกัดไม่เกิน 25 ตัวเลือก)
   const entries = Object.entries(products).slice(0, 24);
   const counts = await Promise.all(entries.map(([key]) => stockManager.getStockCount(key)));
@@ -471,7 +487,7 @@ async function buildShopComponents(products, stockManager) {
   if (options.length) {
     rows.push(
       new ActionRowBuilder().addComponents(
-        new StringSelectMenuBuilder().setCustomId(SELECT_ID).setPlaceholder("เลือกสินค้าที่นี่").setMinValues(1).setMaxValues(1).addOptions(options),
+        new StringSelectMenuBuilder().setCustomId(variant === "second" ? SELECT_ID_2 : SELECT_ID).setPlaceholder("เลือกสินค้าที่นี่").setMinValues(1).setMaxValues(1).addOptions(options),
       ),
     );
   }
@@ -488,11 +504,14 @@ async function refreshShopEmbed(interaction) {
   try {
     const message = interaction.isFromMessage?.() ? interaction.message : null;
     if (!message) return;
+    const variant = message.components?.some((row) => row.components?.some((component) => component.customId === SELECT_ID_2))
+      ? "second"
+      : "default";
     const products = await stockManager._loadProducts();
-    const components = await buildShopComponents(products, stockManager);
+    const components = await buildShopComponents(products, stockManager, variant);
     const totalSold = await stockManager.getTotalSold();
     // แนบรูปแบนเนอร์เดิมไว้ให้อัตโนมัติ ตราบใดที่เราไม่ส่ง attachments ใหม่
-    await message.edit({ embeds: [makeShopEmbed(totalSold)], components });
+    await message.edit({ embeds: [makeShopEmbed(totalSold, variant)], components });
   } catch (e) {
    //console.log(`Failed to refresh shop embed: ${e}`);
   }
@@ -501,12 +520,13 @@ async function refreshShopEmbed(interaction) {
 /** เลือกสินค้าจาก dropdown → เปิดหน้าต่างกรอกลิงก์ซอง (ต้องเปิด modal เป็น response แรก จึง defer ไม่ได้) */
 async function handleProductSelect(interaction) {
   const selectedValue = interaction.values[0];
+  const variant = interaction.customId === SELECT_ID_2 ? "second" : "default";
 
   if (selectedValue === CLEAR_SELECTION_ID) {
     const products = await stockManager._loadProducts();
-    const components = await buildShopComponents(products, stockManager);
+    const components = await buildShopComponents(products, stockManager, variant);
     const totalSold = await stockManager.getTotalSold();
-    await interaction.update({ embeds: [makeShopEmbed(totalSold)], components });
+    await interaction.update({ embeds: [makeShopEmbed(totalSold, variant)], components });
     return;
   }
 
@@ -683,11 +703,14 @@ async function handlePurchaseSubmit(interaction) {
 async function handleReload(interaction) {
   await interaction.deferUpdate();
 
+  const variant = interaction.message.components?.some((row) => row.components?.some((component) => component.customId === SELECT_ID_2))
+    ? "second"
+    : "default";
   const products = await stockManager._loadProducts();
-  const components = await buildShopComponents(products, stockManager);
+  const components = await buildShopComponents(products, stockManager, variant);
   const totalSold = await stockManager.getTotalSold();
 
-  await interaction.message.edit({ embeds: [makeShopEmbed(totalSold)], components });
+  await interaction.message.edit({ embeds: [makeShopEmbed(totalSold, variant)], components });
   await interaction.followUp({
     embeds: [makeStatusEmbed("รีเฟรชสำเร็จ", "อัปเดตแผงร้านค้าและจำนวนสต็อกล่าสุดแล้ว", "success")],
     flags: EPHEMERAL,
@@ -718,6 +741,7 @@ const commands = [
     .addStringOption((o) => o.setName("text").setDescription("ข้อมูลสต็อก (หนึ่งบรรทัดต่อหนึ่งชิ้น)"))
     .addAttachmentOption((o) => o.setName("attachment").setDescription("ไฟล์ .txt (UTF-8) หนึ่งบรรทัดต่อหนึ่งชิ้น")),
   adminCommand().setName("postshop").setDescription("[Admin] โพสต์แผงร้านค้าแบบ Dropdown"),
+  adminCommand().setName("postshop2").setDescription("[Admin] โพสต์แผงร้านค้าชุดที่ 2 แบบ Dropdown"),
 ];
 
 export const commandHandlers = {
@@ -787,6 +811,26 @@ export const commandHandlers = {
     const files = [bannerFile, logoFile].filter(Boolean);
     await interaction.editReply({ embeds: [embed], components, files });
   },
+
+  async postshop2(interaction) {
+    const products = await stockManager._loadProducts();
+    if (Object.keys(products).length === 0) {
+      return interaction.reply({
+        embeds: [makeStatusEmbed("ยังไม่มีสินค้า", "กรุณาใช้ /createproduct เพื่อเพิ่มสินค้าก่อนโพสต์ร้านค้า", "warning")],
+        flags: EPHEMERAL,
+      });
+    }
+
+    await interaction.deferReply();
+    const totalSold = await stockManager.getTotalSold();
+    const embed = makeShopEmbed(totalSold, "second");
+    const bannerFile = getBannerFile("second");
+    const logoFile = getLogoFile("second");
+    const components = await buildShopComponents(products, stockManager, "second");
+
+    const files = [bannerFile, logoFile].filter(Boolean);
+    await interaction.editReply({ embeds: [embed], components, files });
+  },
 };
 
 function isOwnerCommandInteraction(interaction) {
@@ -806,7 +850,7 @@ export async function dispatchInteraction(interaction) {
 
       const handler = commandHandlers[interaction.commandName];
       if (handler) await handler(interaction);
-    } else if (interaction.isStringSelectMenu() && interaction.customId === SELECT_ID) {
+    } else if (interaction.isStringSelectMenu() && [SELECT_ID, SELECT_ID_2].includes(interaction.customId)) {
       await handleProductSelect(interaction);
     } else if (interaction.isButton() && interaction.customId === RELOAD_ID) {
       await handleReload(interaction);
