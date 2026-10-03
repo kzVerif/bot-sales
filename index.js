@@ -298,8 +298,9 @@ export const TrueMoneyAPI = {
      //console.log(`[TrueMoney] Parsed status code=${status.code ?? "<missing>"} message=${status.message ?? "<missing>"}`);
 
       if (resp.status === 200 && status.code === "SUCCESS") {
-       //console.log(`[TrueMoney] Redeem succeeded amount=${data?.data?.amount ?? 0} duration=${Date.now() - startedAt}ms`);
-        return { success: true, amount: data?.data?.amount ?? 0 };
+        const amount = parseInt(data?.data?.voucher?.redeemed_amount_baht, 10) || 0;
+       //console.log(`[TrueMoney] Redeem succeeded amount=${amount} duration=${Date.now() - startedAt}ms`);
+        return { success: true, amount };
       }
 
       console.error(`[TrueMoney] Redeem failed duration=${Date.now() - startedAt}ms error=${status.message ?? "unknown"}`);
