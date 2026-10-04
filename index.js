@@ -14,15 +14,14 @@ import {
   EmbedBuilder,
   Events,
   GatewayIntentBits,
-  InteractionContextType,
   MessageFlags,
   ModalBuilder,
-  SlashCommandBuilder,
   StringSelectMenuBuilder,
   StringSelectMenuOptionBuilder,
   TextInputBuilder,
   TextInputStyle,
 } from "discord.js";
+import { adminErrorMessage, handleLicenseInteraction, isAdmin, licenseCommands, licenseHelp } from "./license_admin.js";
 
 // ==========================================
 // 1. Configuration
@@ -33,6 +32,7 @@ const SHOP_PHONE_NUMBER = "0827695499";
 const ADMIN_ROLE_ID = "1498314230494134445"; // (ไม่ได้ใช้งาน — เก็บไว้เหมือนไฟล์เดิม)
 // ID ของ Discord ต้องเป็น string เสมอ (ตัวเลขยาวเกินที่ JS เก็บได้แม่นยำ)
 const OWNER_ID = "472356060632580097"; // เจ้าของบอท — รับ DM แจ้งเตือนเมื่อมีคนซื้อ
+const PREFIX = "!ap"; // คำสั่งแอดมินทั้งหมด เช่น !ap postshop, !ap keypanel
 
 const STOCK_DIR = "stock";
 const PRODUCTS_FILE = "products.json";
@@ -722,49 +722,57 @@ async function handleReload(interaction) {
 // 5. Bot Setup & Commands
 // ==========================================
 export const stockManager = new StockManager();
-export const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+export const client = new Client({
+  // GuildMessages + MessageContent ใช้อ่านคำสั่ง !ap (ต้องเปิด Message Content Intent ใน Developer Portal ด้วย)
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
+});
 
-// คำสั่งจัดการร้านใช้ได้เฉพาะในเซิร์ฟเวอร์ ส่วนสิทธิ์จริงตรวจจาก OWNER_ID ใน dispatchInteraction
-const adminCommand = () =>
-  new SlashCommandBuilder()
-    .setContexts(InteractionContextType.Guild);
+const replyStatus = (message, title, description, kind) =>
+  message.reply({ embeds: [makeStatusEmbed(title, description, kind)] });
 
-const commands = [
-  adminCommand()
-    .setName("createproduct")
-    .setDescription("[Admin] สร้างสินค้าใหม่")
-    .addStringOption((o) => o.setName("name").setDescription("ชื่อสินค้า").setRequired(true))
-    .addNumberOption((o) => o.setName("price").setDescription("ราคา (บาท)").setRequired(true)),
-  adminCommand()
-    .setName("restock")
-    .setDescription("[Admin] เติมสต็อกสินค้า")
-    .addStringOption((o) => o.setName("product").setDescription("ชื่อสินค้า").setRequired(true))
-    .addStringOption((o) => o.setName("text").setDescription("ข้อมูลสต็อก (หนึ่งบรรทัดต่อหนึ่งชิ้น)"))
-    .addAttachmentOption((o) => o.setName("attachment").setDescription("ไฟล์ .txt (UTF-8) หนึ่งบรรทัดต่อหนึ่งชิ้น")),
-  adminCommand().setName("postshop").setDescription("[Admin] โพสต์แผงร้านค้าแบบ Dropdown"),
-  adminCommand().setName("postshop2").setDescription("[Admin] โพสต์แผงร้านค้าชุดที่ 2 แบบ Dropdown"),
-];
+/** โพสต์แผงร้านค้าในช่องที่พิมพ์คำสั่ง แล้วลบข้อความคำสั่งทิ้ง */
+async function postShopPanel(message, variant) {
+  const products = await stockManager._loadProducts();
+  if (Object.keys(products).length === 0) {
+    return replyStatus(message, "ยังไม่มีสินค้า", "กรุณาใช้ `!ap createproduct` เพื่อเพิ่มสินค้าก่อนโพสต์ร้านค้า", "warning");
+  }
+  const totalSold = await stockManager.getTotalSold();
+  const embed = makeShopEmbed(totalSold, variant);
+  const components = await buildShopComponents(products, stockManager, variant);
+  const files = [getBannerFile(variant), getLogoFile(variant)].filter(Boolean);
+  await message.channel.send({ embeds: [embed], components, files });
+  await message.delete().catch(() => {}); // ลบข้อความคำสั่งทิ้ง (ถ้าบอทมีสิทธิ์)
+}
 
+// คำสั่งแอดมินแบบ prefix: handler(message, args, body)
+//   args = คำที่ตามหลังชื่อคำสั่งในบรรทัดแรก, body = ข้อความตั้งแต่บรรทัดที่ 2 ลงไป
 export const commandHandlers = {
-  async createproduct(interaction) {
-    await interaction.deferReply({ flags: EPHEMERAL }); // ตอบรับ Discord ภายใน 3 วิ แล้วค่อยทำงาน
-    const name = interaction.options.getString("name", true);
-    const price = interaction.options.getNumber("price", true);
+  /** !ap createproduct <ชื่อสินค้า> <ราคา> */
+  async createproduct(message, args) {
+    const price = Number(args.at(-1));
+    const name = args.slice(0, -1).join(" ");
+    if (!name || !Number.isFinite(price)) {
+      return replyStatus(message, "รูปแบบคำสั่งไม่ถูกต้อง", "ใช้แบบนี้: `!ap createproduct <ชื่อสินค้า> <ราคา>`", "error");
+    }
     const { success, msg } = await stockManager.createProduct(name, price);
-    await interaction.followUp({
-      embeds: [makeStatusEmbed(success ? "สร้างสินค้า" : "เกิดข้อผิดพลาด", msg, success ? "success" : "error")],
-      flags: EPHEMERAL,
-    });
+    await replyStatus(message, success ? "สร้างสินค้า" : "เกิดข้อผิดพลาด", msg, success ? "success" : "error");
   },
 
-  async restock(interaction) {
-    await interaction.deferReply({ flags: EPHEMERAL }); // อ่านไฟล์แนบ/เขียนสต็อกอาจเกิน 3 วิ
-    const product = interaction.options.getString("product", true);
-    const text = interaction.options.getString("text");
-    const attachment = interaction.options.getAttachment("attachment");
+  /** !ap restock <ชื่อสินค้า> แล้วขึ้นบรรทัดใหม่ใส่สต็อก (หนึ่งบรรทัดต่อชิ้น) และ/หรือแนบไฟล์ .txt */
+  async restock(message, args, body) {
+    const product = args.join(" ");
+    if (!product) {
+      return replyStatus(
+        message,
+        "รูปแบบคำสั่งไม่ถูกต้อง",
+        "ใช้แบบนี้:\n```\n!ap restock ชื่อสินค้า\nสต็อกชิ้นที่ 1\nสต็อกชิ้นที่ 2\n```หรือแนบไฟล์ .txt (UTF-8) หนึ่งบรรทัดต่อหนึ่งชิ้น",
+        "error",
+      );
+    }
 
     const linesToAdd = [];
-    if (text) linesToAdd.push(...text.split("\n"));
+    if (body.trim()) linesToAdd.push(...body.split("\n"));
+    const attachment = message.attachments.first();
     if (attachment) {
       try {
         const res = await fetch(attachment.url);
@@ -772,86 +780,72 @@ export const commandHandlers = {
         const content = new TextDecoder("utf-8", { fatal: true }).decode(await res.arrayBuffer());
         linesToAdd.push(...content.split("\n"));
       } catch {
-        return interaction.followUp({
-          embeds: [makeStatusEmbed("อ่านไฟล์แนบไม่สำเร็จ", "กรุณาตรวจสอบว่าไฟล์เป็น .txt ที่เข้ารหัส UTF-8", "error")],
-          flags: EPHEMERAL,
-        });
+        return replyStatus(message, "อ่านไฟล์แนบไม่สำเร็จ", "กรุณาตรวจสอบว่าไฟล์เป็น .txt ที่เข้ารหัส UTF-8", "error");
       }
     }
 
     if (linesToAdd.length === 0) {
-      return interaction.followUp({
-        embeds: [makeStatusEmbed("ไม่มีข้อมูล", "กรุณาใส่ข้อความหรือแนบไฟล์ .txt", "error")],
-        flags: EPHEMERAL,
-      });
+      return replyStatus(message, "ไม่มีข้อมูล", "กรุณาใส่สต็อกในบรรทัดถัดไปหรือแนบไฟล์ .txt", "error");
     }
 
     const { success, msg } = await stockManager.addStockLines(product, linesToAdd);
-    await interaction.followUp({
-      embeds: [makeStatusEmbed(success ? "เติมสต็อกสำเร็จ" : "เกิดข้อผิดพลาด", msg, success ? "success" : "error")],
-      flags: EPHEMERAL,
-    });
+    await replyStatus(message, success ? "เติมสต็อกสำเร็จ" : "เกิดข้อผิดพลาด", msg, success ? "success" : "error");
   },
 
-  async postshop(interaction) {
-    const products = await stockManager._loadProducts();
-    if (Object.keys(products).length === 0) {
-      return interaction.reply({
-        embeds: [makeStatusEmbed("ยังไม่มีสินค้า", "กรุณาใช้ /createproduct เพื่อเพิ่มสินค้าก่อนโพสต์ร้านค้า", "warning")],
-        flags: EPHEMERAL,
-      });
-    }
-
-    await interaction.deferReply(); // ตอบรับ Discord ก่อน แล้วค่อยเตรียมแผงร้านค้า
-    const totalSold = await stockManager.getTotalSold();
-    const embed = makeShopEmbed(totalSold);
-    const bannerFile = getBannerFile();
-    const logoFile = getLogoFile();
-    const components = await buildShopComponents(products, stockManager);
-
-    const files = [bannerFile, logoFile].filter(Boolean);
-    await interaction.editReply({ embeds: [embed], components, files });
+  /** !ap postshop */
+  async postshop(message) {
+    await postShopPanel(message);
   },
 
-  async postshop2(interaction) {
-    const products = await stockManager._loadProducts();
-    if (Object.keys(products).length === 0) {
-      return interaction.reply({
-        embeds: [makeStatusEmbed("ยังไม่มีสินค้า", "กรุณาใช้ /createproduct เพื่อเพิ่มสินค้าก่อนโพสต์ร้านค้า", "warning")],
-        flags: EPHEMERAL,
-      });
-    }
+  /** !ap postshop2 */
+  async postshop2(message) {
+    await postShopPanel(message, "second");
+  },
 
-    await interaction.deferReply();
-    const totalSold = await stockManager.getTotalSold();
-    const embed = makeShopEmbed(totalSold, "second");
-    const bannerFile = getBannerFile("second");
-    const logoFile = getLogoFile("second");
-    const components = await buildShopComponents(products, stockManager, "second");
+  ...licenseCommands,
 
-    const files = [bannerFile, logoFile].filter(Boolean);
-    await interaction.editReply({ embeds: [embed], components, files });
+  /** !ap help */
+  async help(message) {
+    const embed = makeStatusEmbed(
+      "คำสั่งแอดมิน",
+      [
+        "`!ap createproduct <ชื่อสินค้า> <ราคา>` — สร้างสินค้าใหม่",
+        "`!ap restock <ชื่อสินค้า>` + สต็อกบรรทัดถัดไป หรือแนบไฟล์ .txt — เติมสต็อก",
+        "`!ap postshop` / `!ap postshop2` — โพสต์แผงร้านค้า",
+        ...licenseHelp,
+      ].join("\n"),
+      "info",
+    );
+    await message.reply({ embeds: [embed] });
   },
 };
 
-function isOwnerCommandInteraction(interaction) {
-  return interaction.inGuild() && interaction.user?.id === OWNER_ID;
+/** ตัวกลางรับคำสั่ง !ap — ใช้ได้เฉพาะในเซิร์ฟเวอร์และเฉพาะแอดมิน */
+export async function dispatchMessage(message) {
+  if (message.author.bot || !message.inGuild()) return;
+  const [firstLine, ...rest] = message.content.split("\n");
+  const [prefix, rawName, ...args] = firstLine.trim().split(/\s+/);
+  if (prefix?.toLowerCase() !== PREFIX) return;
+
+  try {
+    if (!isAdmin(message.author.id)) {
+      return await replyStatus(message, "ไม่มีสิทธิ์ใช้งาน", "คำสั่งนี้ใช้ได้เฉพาะแอดมินเท่านั้น", "error");
+    }
+    const name = (rawName || "help").toLowerCase();
+    const handler = Object.hasOwn(commandHandlers, name) ? commandHandlers[name] : commandHandlers.help;
+    await handler(message, args, rest.join("\n"));
+  } catch (err) {
+    const known = adminErrorMessage(err);
+    if (!known) console.error("Command error:", err);
+    await replyStatus(message, "เกิดข้อผิดพลาด", known ?? "ระบบขัดข้องชั่วคราว กรุณาลองใหม่อีกครั้ง", "error").catch(() => {});
+  }
 }
 
 /** ตัวกลางรับ interaction ทุกชนิด — ถ้าเกิด error จะแจ้งผู้ใช้แทนที่จะค้างที่ "กำลังคิด..." */
 export async function dispatchInteraction(interaction) {
   try {
-    if (interaction.isChatInputCommand()) {
-      if (!isOwnerCommandInteraction(interaction)) {
-        return interaction.reply({
-          embeds: [makeStatusEmbed("ไม่มีสิทธิ์ใช้งาน", "คำสั่งนี้ใช้ได้เฉพาะ Owner เท่านั้น", "error")],
-          flags: EPHEMERAL,
-        });
-      }
-
-      const handler = commandHandlers[interaction.commandName];
-      if (handler) await handler(interaction);
-    } else if (interaction.isStringSelectMenu() && [SELECT_ID, SELECT_ID_2].includes(interaction.customId)) {
+    if (await handleLicenseInteraction(interaction)) return;
+    if (interaction.isStringSelectMenu() && [SELECT_ID, SELECT_ID_2].includes(interaction.customId)) {
       await handleProductSelect(interaction);
     } else if (interaction.isButton() && interaction.customId === RELOAD_ID) {
       await handleReload(interaction);
@@ -874,10 +868,12 @@ export async function dispatchInteraction(interaction) {
 }
 
 client.once(Events.ClientReady, async (c) => {
- console.log(`✅ Logged in as ${c.user.tag}`);
-  await c.application.commands.set(commands.map((cmd) => cmd.toJSON()));
- console.log("🔄 Slash commands synced.");
+  console.log(`✅ Logged in as ${c.user.tag}`);
+  // เปลี่ยนมาใช้คำสั่ง !ap แล้ว — ลบ slash command เก่าที่เคยลงทะเบียนไว้
+  await c.application.commands.set([]);
+  console.log(`🔄 ใช้คำสั่ง ${PREFIX} (พิมพ์ ${PREFIX} help เพื่อดูคำสั่งทั้งหมด)`);
 });
+client.on(Events.MessageCreate, dispatchMessage);
 client.on(Events.InteractionCreate, dispatchInteraction);
 
 process.on("unhandledRejection", (err) => console.error("Unhandled rejection:", err));
@@ -888,5 +884,16 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     console.error("❌ ไม่พบ BOT_TOKEN — สร้างไฟล์ .env แล้วใส่ BOT_TOKEN=โทเคนบอท (ดูตัวอย่างใน .env.example)");
     process.exit(1);
   }
-  client.login(BOT_TOKEN);
+  client.login(BOT_TOKEN).catch((err) => {
+    if (/disallowed intents/i.test(err.message)) {
+      console.error(
+        "❌ บอทยังไม่ได้เปิด Message Content Intent (จำเป็นสำหรับคำสั่ง !ap)\n" +
+          "   ไปที่ https://discord.com/developers/applications → เลือกบอท → Bot → Privileged Gateway Intents\n" +
+          "   → เปิด MESSAGE CONTENT INTENT → Save Changes แล้วรันใหม่",
+      );
+    } else {
+      console.error("❌ Login ไม่สำเร็จ:", err);
+    }
+    process.exit(1);
+  });
 }
