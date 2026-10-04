@@ -721,23 +721,18 @@ async function handleSelect(interaction) {
 // ==========================================
 export const isAdmin = (userId) => ADMIN_IDS.has(userId);
 
-/** คำสั่ง prefix ของระบบคีย์: !ap keypanel, !ap key <คีย์> */
+/** slash command ของระบบคีย์: /keypanel, /key (index.js เป็นคนลงทะเบียนคำสั่ง) */
 export const licenseCommands = {
-  async keypanel(message) {
-    await message.channel.send(panelMessage());
-    await message.delete().catch(() => {}); // ลบข้อความคำสั่งทิ้ง (ถ้าบอทมีสิทธิ์)
+  async keypanel(interaction) {
+    await interaction.reply({ content: "โพสต์แผงจัดการ License Key แล้ว ✅", flags: EPHEMERAL });
+    await interaction.channel.send(panelMessage());
   },
 
-  async key(message, args) {
-    if (!args[0]) throw new AdminError("ใช้แบบนี้: `!ap key APF-XXXX-XXXX-XXXX-XXXX`");
-    await message.reply(keyView(await getRow(args.join(""))));
+  async key(interaction) {
+    await interaction.deferReply({ flags: EPHEMERAL });
+    await interaction.editReply(keyView(await getRow(interaction.options.getString("key", true))));
   },
 };
-
-export const licenseHelp = [
-  "`!ap keypanel` — โพสต์แผงจัดการ License Key",
-  "`!ap key <คีย์>` — เปิดหน้าจัดการคีย์",
-];
 
 /** แปลง error เป็นข้อความที่แสดงให้แอดมินได้ (null = error ภายใน ไม่ควรโชว์รายละเอียด) */
 export const adminErrorMessage = (err) => (err instanceof AdminError ? err.message : null);
