@@ -40,7 +40,28 @@ const TEST_WEBHOOK = (process.env.RELEASE_TEST_WEBHOOK || "").trim(); // ตั�
 const APP_NAME = process.env.RELEASE_APP_NAME || "Auto Post FB";
 
 const KEY_ALPHABET ="ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // ตัด 0/O/1/I ที่อ่านสับสน
-const PLANS = { basic: 1, plus: 2, pro: 5 };
+// แพ็กเกจ (ชื่อ/จำนวนบัญชี/ฟีเจอร์) อ่านจากตาราง plans ใน Supabase — แก้ที่ DB ได้เลยไม่ต้องแก้โค้ด
+const UNLIMITED_ACCOUNTS = 9999; // max_accounts สูงสุดที่ schema ยอมรับ = ไม่จำกัด
+const FEATURE_LABELS = {
+  post: "โพสต์",
+  comment: "คอมเมนต์",
+  post_links: "โพสต์ลิงก์",
+  check_links: "เช็คลิงก์",
+  joined_groups: "กลุ่มที่เข้าร่วม",
+  discord: "แจ้งเตือน Discord",
+  like: "กดไลก์",
+};
+const EVENT_LABELS = {
+  created: "🆕 สร้างคีย์",
+  activated: "▶️ เริ่มใช้งานครั้งแรก",
+  device_bound: "💻 ผูกเครื่องใหม่",
+  extended: "⏳ ต่ออายุ",
+  plan_changed: "📦 เปลี่ยนแพ็กเกจ",
+  features_changed: "✨ เปลี่ยนฟีเจอร์เสริม",
+  hwid_reset: "🔓 ปลดเครื่อง",
+  revoked: "⛔ ยกเลิกคีย์",
+  restored: "♻️ เปิดใช้อีกครั้ง",
+};
 const LEVELS = { info: "ทั่วไป", warn: "เตือน", critical: "สำคัญมาก" };
 const PAGE_SIZE = 10;
 const MAX_GEN = 25;
@@ -87,13 +108,12 @@ async function api(method, query, body, prefer) {
   const raw = await res.text();
   if (!res.ok) {
     const detail = raw.slice(0, 400);
-    if (detail.includes("max_accounts")) {
-      throw new AdminError("ตาราง licenses ยังไม่มีคอลัมน์แพ็กเกจ — รัน supabase/license.sql อีกครั้งใน SQL Editor");
+    // PGRST205 = ไม่มีตาราง, 42703/PGRST204 = ไม่มีคอลัมน์ → ฐานข้อมูลยังเป็นโครงสร้างเก่า
+    if (/PGRST205|PGRST204|42703/.test(detail)) {
+      throw new AdminError("โครงสร้างฐานข้อมูลไม่ตรงกับบอท — รันไฟล์ schema.sql ใน Supabase SQL Editor ก่อน");
     }
-    if (detail.includes("PGRST205")) {
-      const table = query.startsWith("app_info") ? "app_info" : "license";
-      throw new AdminError(`ยังไม่มีตาราง — รัน supabase/${table}.sql ใน Supabase SQL Editor ก่อน`);
-    }
+    if (detail.includes("licenses_plan_fkey")) throw new AdminError("ไม่พบแพ็กเกจนี้ในตาราง plans");
+    if (detail.includes("licenses_max_accounts_check")) throw new AdminError(`จำนวนบัญชีต้องอยู่ระหว่าง 1–${UNLIMITED_ACCOUNTS}`);
     throw new AdminError(`Supabase ตอบกลับ HTTP ${res.status}: ${detail}`);
   }
   return raw ? JSON.parse(raw) : null;
@@ -126,12 +146,33 @@ function fmtTs(value) {
   return `<t:${unix}:f> (<t:${unix}:R>)`;
 }
 
-function planName(accounts) {
-  const n = accounts ?? 1;
-  const name = Object.keys(PLANS).find((p) => PLANS[p] === n);
-  return name ? name[0].toUpperCase() + name.slice(1) : "Custom";
+/** แพ็กเกจทั้งหมดจากตาราง plans (Map code → แถว) เรียงตาม sort_order */
+let planCache = null; // ไว้ใช้ตอนต้องเปิด modal ทันที (ห้ามรอ DB เกิน 3 วิ)
+async function getPlans() {
+  const rows = await api("GET", "plans?select=*&order=sort_order.asc");
+  if (!rows?.length) throw new AdminError("ตาราง plans ว่าง — รันไฟล์ schema.sql ใน Supabase SQL Editor ก่อน");
+  return (planCache = new Map(rows.map((p) => [p.code, p])));
 }
-const planLabel = (accounts) => `${planName(accounts)} · ${accounts ?? 1} บัญชี`;
+
+const fmtAccounts = (n) => (n >= UNLIMITED_ACCOUNTS ? "ไม่จำกัดบัญชี" : `${n} บัญชี`);
+const featureLabel = (f) => FEATURE_LABELS[f] ?? f;
+const planName = (row, plans) => plans.get(row.plan)?.name ?? row.plan;
+/** จำนวนบัญชีจริง: ค่าที่กำหนดเองในคีย์ (max_accounts) ก่อน ไม่งั้นใช้ของแพ็กเกจ — ตรงกับ check_license */
+const accountsOf = (row, plans) => row.max_accounts ?? plans.get(row.plan)?.max_accounts ?? 1;
+const planLabel = (row, plans) =>
+  `${planName(row, plans)} · ${fmtAccounts(accountsOf(row, plans))}${row.max_accounts != null ? " (กำหนดเอง)" : ""}`;
+/** ฟีเจอร์ทั้งหมดที่ใช้ได้ = ของแพ็กเกจ + ฟีเจอร์เสริมเฉพาะคีย์ */
+const featuresOf = (row, plans) => [...new Set([...(plans.get(row.plan)?.features ?? []), ...(row.extra_features ?? [])])].sort();
+
+/** บันทึกประวัติลง license_events (ไม่ให้การบันทึกพลาดไปขัดงานหลัก) */
+async function logEvent(keys, type, detail = {}) {
+  const rows = [keys].flat().map((key) => ({ key, type, detail }));
+  try {
+    await api("POST", "license_events", rows, "return=minimal");
+  } catch (err) {
+    console.error(`[License] บันทึกประวัติ ${type} ไม่สำเร็จ:`, err.message);
+  }
+}
 
 function statusOf(row) {
   if (row.status === "revoked") return { text: "ยกเลิกแล้ว", color: COLORS.error, live: false };
@@ -154,17 +195,29 @@ async function updateRow(key, fields) {
   return rows[0];
 }
 
-function parseAccounts(planText, accountsText) {
-  const plan = (planText || "basic").trim().toLowerCase();
-  if (!(plan in PLANS)) throw new AdminError("แพ็กเกจต้องเป็น basic / plus / pro");
-  const accounts = accountsText?.trim() ? Number(accountsText.trim()) : PLANS[plan];
-  if (!Number.isInteger(accounts) || accounts < 1 || accounts > 50) throw new AdminError("จำนวนบัญชีต้องอยู่ระหว่าง 1–50");
+/** รหัสแพ็กเกจที่พิมพ์มา → แถวในตาราง plans (คีย์ใหม่ต้องเป็นแพ็กเกจที่ยังเปิดขาย) */
+function parsePlan(planText, plans) {
+  const code = (planText || "basic").trim().toLowerCase();
+  const plan = plans.get(code);
+  const active = [...plans.values()].filter((p) => p.is_active).map((p) => p.code);
+  if (!plan || !plan.is_active) throw new AdminError(`แพ็กเกจต้องเป็น ${active.join(" / ")}`);
+  return plan;
+}
+
+/** จำนวนบัญชีที่กำหนดเอง — ว่าง = ใช้ตามแพ็กเกจ (null) */
+function parseAccounts(accountsText) {
+  const text = accountsText?.trim();
+  if (!text) return null;
+  const accounts = Number(text);
+  if (!Number.isInteger(accounts) || accounts < 1 || accounts > UNLIMITED_ACCOUNTS) {
+    throw new AdminError(`จำนวนบัญชีต้องอยู่ระหว่าง 1–${UNLIMITED_ACCOUNTS}`);
+  }
   return accounts;
 }
 
 async function getAppInfo() {
   const rows = await api("GET", "app_info?id=eq.1&select=*");
-  if (!rows?.length) throw new AdminError("ไม่พบตาราง app_info — รัน supabase/app_info.sql ใน SQL Editor ก่อน");
+  if (!rows?.length) throw new AdminError("ไม่พบข้อมูลใน app_info — รันไฟล์ schema.sql ใน Supabase SQL Editor ก่อน");
   return rows[0];
 }
 
@@ -370,8 +423,9 @@ function panelMessage() {
   return { embeds: [embed], components: [row] };
 }
 
-function keyView(row, notice) {
+function keyView(row, plans, notice) {
   const st = statusOf(row);
+  const extras = row.extra_features ?? [];
   const embed = new EmbedBuilder()
     .setTitle("🔑 รายละเอียดคีย์")
     .setDescription(`${notice ? `${notice}\n` : ""}\`\`\`${row.key}\`\`\``)
@@ -379,12 +433,16 @@ function keyView(row, notice) {
     .addFields(
       { name: "สถานะ", value: st.text, inline: true },
       { name: "ระยะเวลา", value: fmtHours(row.duration_hours), inline: true },
-      { name: "แพ็กเกจ", value: planLabel(row.max_accounts), inline: true },
+      { name: "แพ็กเกจ", value: planLabel(row, plans), inline: true },
       { name: "เริ่มใช้", value: fmtTs(row.activated_at), inline: true },
       { name: "หมดอายุ", value: fmtTs(row.expires_at), inline: true },
       { name: "ใช้ล่าสุด", value: fmtTs(row.last_seen_at), inline: true },
       { name: "ผูกเครื่อง", value: row.hwid ? `\`${row.hwid.slice(0, 16).toUpperCase()}\`` : "-", inline: true },
       { name: "หมายเหตุ", value: row.note || "-", inline: true },
+      {
+        name: "ฟีเจอร์ที่ใช้ได้",
+        value: truncate(featuresOf(row, plans).map((f) => (extras.includes(f) ? `**${featureLabel(f)}** ✨` : featureLabel(f))).join(", ") || "-", 1024),
+      },
     );
 
   const k = row.key;
@@ -397,24 +455,69 @@ function keyView(row, notice) {
       : button(`ak:revoke:${k}`, "ยกเลิกคีย์", ButtonStyle.Danger, "⛔"),
     button(`ak:view:${k}`, "รีเฟรช", ButtonStyle.Secondary, "🔄"),
   );
-  const current = row.max_accounts ?? 1;
+  const more = new ActionRowBuilder().addComponents(button(`ak:hist:${k}`, "ประวัติคีย์", ButtonStyle.Secondary, "📜"));
+
+  // แพ็กเกจที่เลิกขายแล้วจะไม่ให้เลือกใหม่ แต่ยังโชว์ถ้าคีย์นี้ใช้อยู่
+  const planOptions = [...plans.values()]
+    .filter((p) => p.is_active || p.code === row.plan)
+    .slice(0, 22)
+    .map((p) => ({
+      label: truncate(`${p.name} · ${fmtAccounts(p.max_accounts)}${p.is_active ? "" : " (เลิกขาย)"}`, 100),
+      description: truncate(p.features.map(featureLabel).join(", ") || "ไม่มีฟีเจอร์", 100),
+      value: `p:${p.code}`,
+      default: p.code === row.plan && row.max_accounts == null,
+    }));
+  planOptions.push({ label: "กำหนดจำนวนบัญชีเอง…", value: "custom", emoji: "✏️", default: row.max_accounts != null });
+  if (row.max_accounts != null) planOptions.push({ label: "ใช้จำนวนบัญชีตามแพ็กเกจ", value: "reset", emoji: "↩️" });
   const planSelect = new ActionRowBuilder().addComponents(
     new StringSelectMenuBuilder()
       .setCustomId(`ak:plan:${k}`)
-      .setPlaceholder(`เปลี่ยนแพ็กเกจ (ตอนนี้: ${planLabel(current)})`)
-      .addOptions(
-        ...Object.entries(PLANS).map(([name, n]) => ({
-          label: `${planName(n)} · ${n} บัญชี`,
-          value: name,
-          default: n === current,
-        })),
-        { label: "กำหนดจำนวนบัญชีเอง…", value: "custom", emoji: "✏️" },
-      ),
+      .setPlaceholder(`เปลี่ยนแพ็กเกจ (ตอนนี้: ${planLabel(row, plans)})`)
+      .addOptions(planOptions),
   );
-  return { embeds: [embed], components: [actions, planSelect] };
+
+  const components = [actions, planSelect];
+  // ฟีเจอร์เสริม = ฟีเจอร์ของแพ็กเกจอื่นที่แพ็กเกจของคีย์นี้ไม่มี (เลือกได้หลายอัน, เอาออกหมด = ไม่มีฟีเจอร์เสริม)
+  const planFeatures = new Set(plans.get(row.plan)?.features ?? []);
+  const extraChoices = [...new Set([...[...plans.values()].flatMap((p) => p.features), ...extras])]
+    .filter((f) => !planFeatures.has(f))
+    .slice(0, 25);
+  if (extraChoices.length) {
+    components.push(
+      new ActionRowBuilder().addComponents(
+        new StringSelectMenuBuilder()
+          .setCustomId(`ak:feat:${k}`)
+          .setPlaceholder("ฟีเจอร์เสริมเฉพาะคีย์นี้ (นอกเหนือจากแพ็กเกจ)")
+          .setMinValues(0)
+          .setMaxValues(extraChoices.length)
+          .addOptions(extraChoices.map((f) => ({ label: featureLabel(f), description: f, value: f, default: extras.includes(f) }))),
+      ),
+    );
+  }
+  components.push(more);
+  return { embeds: [embed], components };
 }
 
-function listView(rows, page, showAll) {
+/** ประวัติคีย์จากตาราง license_events (ล่าสุดก่อน) */
+function historyView(key, events) {
+  const lines = events.map((e) => {
+    const d = e.detail ?? {};
+    const extra =
+      e.type === "extended" ? ` +${fmtHours(d.hours ?? 0)}` :
+      e.type === "plan_changed" ? ` ${d.from ?? "?"} ➜ ${d.to ?? "?"}${d.max_accounts ? ` (${fmtAccounts(d.max_accounts)})` : ""}` :
+      e.type === "features_changed" ? ` ${(d.extra_features ?? []).map(featureLabel).join(", ") || "ไม่มี"}` :
+      d.hwid ? ` \`${String(d.hwid).toUpperCase()}\`` : "";
+    return `${fmtTs(e.created_at)}\n└ ${EVENT_LABELS[e.type] ?? e.type}${extra}`;
+  });
+  const embed = new EmbedBuilder()
+    .setTitle("📜 ประวัติคีย์")
+    .setDescription(truncate(`\`${key}\`\n\n${lines.join("\n") || "ยังไม่มีประวัติ"}`, 4000))
+    .setColor(COLORS.info)
+    .setFooter({ text: `แสดง ${events.length} รายการล่าสุด` });
+  return { embeds: [embed] };
+}
+
+function listView(rows, plans, page, showAll) {
   const filtered = showAll ? rows : rows.filter((r) => statusOf(r).live);
   const pages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   page = Math.min(Math.max(page, 0), pages - 1);
@@ -422,7 +525,7 @@ function listView(rows, page, showAll) {
 
   const lines = slice.map((r) => {
     const note = r.note ? ` · ${truncate(r.note, 40)}` : "";
-    return `\`${r.key}\` · ${fmtHours(r.duration_hours)} · ${planName(r.max_accounts)}\n└ ${statusOf(r).text}${note}`;
+    return `\`${r.key}\` · ${fmtHours(r.duration_hours)} · ${planName(r, plans)}\n└ ${statusOf(r).text}${note}`;
   });
   const embed = new EmbedBuilder()
     .setTitle(`📋 รายการคีย์${showAll ? " (ทั้งหมด)" : ""}`)
@@ -505,19 +608,33 @@ const field = (interaction, id) => interaction.fields.getTextInputValue(id).trim
 // ==========================================
 // 5. Interaction handlers
 // ==========================================
+async function loadKey(key) {
+  const [row, plans] = await Promise.all([getRow(key), getPlans()]);
+  return { row, plans };
+}
+
 async function handleGenSubmit(interaction) {
   const hours = parseDuration(field(interaction, "duration"));
-  const accounts = parseAccounts(field(interaction, "plan"), field(interaction, "accounts"));
+  const accounts = parseAccounts(field(interaction, "accounts"));
   const count = Number(field(interaction, "count") || "1");
   if (!Number.isInteger(count) || count < 1 || count > MAX_GEN) throw new AdminError(`จำนวนคีย์ต้องอยู่ระหว่าง 1–${MAX_GEN}`);
   const note = field(interaction, "note") || null;
 
   await interaction.deferReply({ flags: EPHEMERAL });
-  const rows = Array.from({ length: count }, () => ({ key: newKey(), duration_hours: hours, note, max_accounts: accounts }));
+  const plans = await getPlans();
+  const plan = parsePlan(field(interaction, "plan"), plans);
+  const rows = Array.from({ length: count }, () => ({
+    key: newKey(),
+    duration_hours: hours,
+    note,
+    plan: plan.code,
+    max_accounts: accounts,
+  }));
   const created = await api("POST", "licenses", rows, "return=representation");
-  const notice = `✅ สร้างคีย์ ${fmtHours(hours)} แพ็กเกจ ${planLabel(accounts)} แล้ว (เริ่มนับเวลาเมื่อลูกค้าใช้คีย์ครั้งแรก)`;
+  await logEvent(created.map((r) => r.key), "created", { plan: plan.code, duration_hours: hours, max_accounts: accounts });
+  const notice = `✅ สร้างคีย์ ${fmtHours(hours)} แพ็กเกจ ${planLabel(created[0], plans)} แล้ว (เริ่มนับเวลาเมื่อลูกค้าใช้คีย์ครั้งแรก)`;
 
-  if (created.length === 1) return interaction.editReply(keyView(created[0], notice));
+  if (created.length === 1) return interaction.editReply(keyView(created[0], plans, notice));
   const embed = statusEmbed(`สร้างคีย์ ${created.length} อัน`, `${notice}\n\`\`\`\n${created.map((r) => r.key).join("\n")}\n\`\`\``, "success");
   if (note) embed.addFields({ name: "หมายเหตุ", value: note });
   await interaction.editReply({ embeds: [embed] });
@@ -539,25 +656,36 @@ async function handleKeyAction(interaction, action, key) {
     );
   }
 
+  if (action === "hist") {
+    await interaction.deferReply({ flags: EPHEMERAL });
+    const k = normalizeKey(key);
+    const events = await api("GET", `license_events?key=eq.${encodeURIComponent(k)}&select=*&order=created_at.desc&limit=15`);
+    return interaction.editReply(historyView(k, events));
+  }
+
   await interaction.deferUpdate();
-  let row = await getRow(key);
+  let { row, plans } = await loadKey(key);
   let notice;
   if (action === "hwid") {
+    const oldHwid = row.hwid;
     row = await updateRow(row.key, { hwid: null });
+    await logEvent(row.key, "hwid_reset", { hwid: oldHwid?.slice(0, 16) ?? null });
     notice = "✅ ปลดเครื่องแล้ว — ลูกค้าใส่คีย์เดิมในเครื่องใหม่ได้เลย (เวลาที่เหลือเดินต่อ)";
   } else if (action === "revoke") {
     row = await updateRow(row.key, { status: "revoked" });
+    await logEvent(row.key, "revoked");
     notice = "⛔ ยกเลิกคีย์แล้ว — โปรแกรมลูกค้าจะหยุดภายใน 10 นาที";
   } else if (action === "restore") {
     row = await updateRow(row.key, { status: "active" });
+    await logEvent(row.key, "restored");
     notice = "♻️ เปิดใช้คีย์อีกครั้งแล้ว";
   }
-  await interaction.editReply(keyView(row, notice));
+  await interaction.editReply(keyView(row, plans, notice));
 }
 
 async function handleKeyModal(interaction, action, key) {
   await interaction.deferUpdate();
-  let row = await getRow(key);
+  let { row, plans } = await loadKey(key);
   let notice;
   if (action === "extm") {
     const hours = parseDuration(field(interaction, "duration"));
@@ -568,30 +696,52 @@ async function handleKeyModal(interaction, action, key) {
       fields.expires_at = new Date(base + hours * 3_600_000).toISOString();
     }
     row = await updateRow(row.key, fields);
+    await logEvent(row.key, "extended", { hours, expires_at: row.expires_at });
     notice = `✅ ต่ออายุ ${fmtHours(hours)} แล้ว`;
   } else if (action === "notem") {
     row = await updateRow(row.key, { note: field(interaction, "note") || null });
     notice = "✅ แก้หมายเหตุแล้ว";
   } else if (action === "accm") {
-    const accounts = parseAccounts("basic", field(interaction, "accounts"));
+    const accounts = parseAccounts(field(interaction, "accounts"));
+    if (accounts == null) throw new AdminError("กรุณาใส่จำนวนบัญชี");
     row = await updateRow(row.key, { max_accounts: accounts });
-    notice = `✅ เปลี่ยนเป็นแพ็กเกจ ${planLabel(accounts)} แล้ว — โปรแกรมลูกค้าจะใช้ค่าใหม่ภายใน 10 นาที`;
+    await logEvent(row.key, "plan_changed", { from: row.plan, to: row.plan, max_accounts: accounts });
+    notice = `✅ เปลี่ยนเป็น ${planLabel(row, plans)} แล้ว — โปรแกรมลูกค้าจะใช้ค่าใหม่ภายใน 10 นาที`;
   }
-  await interaction.editReply(keyView(row, notice));
+  await interaction.editReply(keyView(row, plans, notice));
 }
 
 async function handlePlanSelect(interaction, key) {
-  const plan = interaction.values[0];
-  if (plan === "custom") {
+  const choice = interaction.values[0];
+  if (choice === "custom") {
     return interaction.showModal(
-      modal(`ak:accm:${key}`, "กำหนดจำนวนบัญชีเอง", [{ id: "accounts", label: "จำนวนบัญชีที่รันพร้อมกัน (1–50)", placeholder: "10", max: 2 }]),
+      modal(`ak:accm:${key}`, "กำหนดจำนวนบัญชีเอง", [
+        { id: "accounts", label: `จำนวนบัญชีที่รันพร้อมกัน (1–${UNLIMITED_ACCOUNTS})`, placeholder: "10", max: 4 },
+      ]),
     );
   }
   await interaction.deferUpdate();
-  const row = await updateRow((await getRow(key)).key, { max_accounts: PLANS[plan] });
+  const { row: current, plans } = await loadKey(key);
+  // เลือกแพ็กเกจ = ใช้จำนวนบัญชีตามแพ็กเกจนั้น (ล้างค่าที่กำหนดเองทิ้ง)
+  const code = choice === "reset" ? current.plan : choice.slice(2);
+  if (!plans.has(code)) throw new AdminError("ไม่พบแพ็กเกจนี้ในตาราง plans");
+  const row = await updateRow(current.key, { plan: code, max_accounts: null });
+  await logEvent(row.key, "plan_changed", { from: current.plan, to: code, max_accounts: null });
   await interaction.editReply(
-    keyView(row, `✅ เปลี่ยนเป็นแพ็กเกจ ${planLabel(PLANS[plan])} แล้ว — โปรแกรมลูกค้าจะใช้ค่าใหม่ภายใน 10 นาที`),
+    keyView(row, plans, `✅ เปลี่ยนเป็นแพ็กเกจ ${planLabel(row, plans)} แล้ว — โปรแกรมลูกค้าจะใช้ค่าใหม่ภายใน 10 นาที`),
   );
+}
+
+async function handleFeatureSelect(interaction, key) {
+  await interaction.deferUpdate();
+  const { row: current, plans } = await loadKey(key);
+  const extras = [...interaction.values].sort();
+  const row = await updateRow(current.key, { extra_features: extras });
+  await logEvent(row.key, "features_changed", { extra_features: extras, before: current.extra_features ?? [] });
+  const notice = extras.length
+    ? `✅ ตั้งฟีเจอร์เสริม: ${extras.map(featureLabel).join(", ")} — โปรแกรมลูกค้าจะใช้ค่าใหม่ภายใน 10 นาที`
+    : "✅ เอาฟีเจอร์เสริมออกทั้งหมดแล้ว (ใช้ตามแพ็กเกจ)";
+  await interaction.editReply(keyView(row, plans, notice));
 }
 
 async function handleAppModal(interaction, id) {
@@ -639,29 +789,33 @@ async function handleButton(interaction) {
   const [, action, ...rest] = id.split(":");
 
   switch (action) {
-    case "gen":
+    case "gen": {
+      // ต้องเปิด modal ทันที จึงใช้รายชื่อแพ็กเกจที่โหลดไว้ล่าสุด (ตรวจจริงกับ DB ตอนกดยืนยัน)
+      const active = planCache ? [...planCache.values()].filter((p) => p.is_active).map((p) => p.code) : [];
+      const planHint = active.length ? active.join(" / ") : "basic / plus / pro";
       return interaction.showModal(
         modal("ak:genm", "สร้างคีย์ใหม่", [
           { id: "duration", label: "ระยะเวลา (12h / 1d / 7d / 30d / 2w)", placeholder: "30d", max: 10 },
-          { id: "plan", label: "แพ็กเกจ (basic=1 / plus=2 / pro=5 บัญชี)", value: "basic", max: 10 },
-          { id: "accounts", label: "จำนวนบัญชีเอง (เว้นว่าง = ตามแพ็กเกจ)", required: false, max: 2 },
+          { id: "plan", label: truncate(`แพ็กเกจ (${planHint})`, 45), value: active[0] ?? "basic", max: 30 },
+          { id: "accounts", label: "จำนวนบัญชีเอง (เว้นว่าง = ตามแพ็กเกจ)", required: false, max: 4 },
           { id: "count", label: `จำนวนคีย์ (1–${MAX_GEN})`, value: "1", max: 2 },
           { id: "note", label: "หมายเหตุ เช่น ชื่อลูกค้า", required: false, max: 200 },
         ]),
       );
+    }
     case "find":
       return interaction.showModal(
         modal("ak:findm", "จัดการคีย์", [{ id: "key", label: "License Key", placeholder: "APF-XXXX-XXXX-XXXX-XXXX", max: 40 }]),
       );
     case "listopen": {
       await interaction.deferReply({ flags: EPHEMERAL });
-      const rows = await api("GET", "licenses?select=*&order=created_at.desc");
-      return interaction.editReply(listView(rows, 0, false));
+      const [rows, plans] = await Promise.all([api("GET", "licenses?select=*&order=created_at.desc"), getPlans()]);
+      return interaction.editReply(listView(rows, plans, 0, false));
     }
     case "list": {
       await interaction.deferUpdate();
-      const rows = await api("GET", "licenses?select=*&order=created_at.desc");
-      return interaction.editReply(listView(rows, Number(rest[0]), rest[1] === "1"));
+      const [rows, plans] = await Promise.all([api("GET", "licenses?select=*&order=created_at.desc"), getPlans()]);
+      return interaction.editReply(listView(rows, plans, Number(rest[0]), rest[1] === "1"));
     }
     case "appopen":
       await interaction.deferReply({ flags: EPHEMERAL });
@@ -688,9 +842,11 @@ async function handleButton(interaction) {
           { id: "level", label: "ระดับ (info=ฟ้า / warn=ส้ม / critical=แดง)", value: "info", max: 10 },
         ]),
       );
-    case "view":
+    case "view": {
       await interaction.deferUpdate();
-      return interaction.editReply(keyView(await getRow(rest[0])));
+      const { row, plans } = await loadKey(rest[0]);
+      return interaction.editReply(keyView(row, plans));
+    }
     default:
       return handleKeyAction(interaction, action, rest[0]);
   }
@@ -701,7 +857,8 @@ async function handleModal(interaction) {
   if (id === "ak:genm") return handleGenSubmit(interaction);
   if (id === "ak:findm") {
     await interaction.deferReply({ flags: EPHEMERAL });
-    return interaction.editReply(keyView(await getRow(field(interaction, "key"))));
+    const { row, plans } = await loadKey(field(interaction, "key"));
+    return interaction.editReply(keyView(row, plans));
   }
   if (id === "ak:relm" || id === "ak:annm") return handleAppModal(interaction, id);
   const [, action, key] = id.split(":");
@@ -711,9 +868,12 @@ async function handleModal(interaction) {
 async function handleSelect(interaction) {
   if (interaction.customId === "ak:pick") {
     await interaction.deferReply({ flags: EPHEMERAL });
-    return interaction.editReply(keyView(await getRow(interaction.values[0])));
+    const { row, plans } = await loadKey(interaction.values[0]);
+    return interaction.editReply(keyView(row, plans));
   }
-  return handlePlanSelect(interaction, interaction.customId.split(":")[2]);
+  const [, kind, key] = interaction.customId.split(":");
+  if (kind === "feat") return handleFeatureSelect(interaction, key);
+  return handlePlanSelect(interaction, key);
 }
 
 // ==========================================
@@ -730,7 +890,8 @@ export const licenseCommands = {
 
   async key(interaction) {
     await interaction.deferReply({ flags: EPHEMERAL });
-    await interaction.editReply(keyView(await getRow(interaction.options.getString("key", true))));
+    const { row, plans } = await loadKey(interaction.options.getString("key", true));
+    await interaction.editReply(keyView(row, plans));
   },
 };
 

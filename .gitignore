@@ -4,3 +4,4 @@ stock
 .env
 node_modules
 admin_secret.txt
+categories.json

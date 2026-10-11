@@ -38,6 +38,8 @@ const OWNER_ID = "472356060632580097"; // เจ้าของบอท — ร
 const STOCK_DIR = "stock";
 const PRODUCTS_FILE = "products.json";
 const STATS_FILE = "stats.json";
+const CATEGORIES_FILE = "categories.json";
+const UNCATEGORIZED_KEY = "__none__"; // หมวดเสมือนสำหรับสินค้าที่ยังไม่ได้จัดหมวด
 
 // ---- UI / branding config (edit freely, this is display only) ----
 const SHOP_TITLE = "ซื้อสินค้าออโต้ | ONLINE 24/7";
@@ -114,10 +116,12 @@ class StockManager {
     this.lock = new Mutex();
     this.productsIO = new Mutex();
     this.statsIO = new Mutex();
+    this.categoriesIO = new Mutex();
 
     if (!existsSync(STOCK_DIR)) mkdirSync(STOCK_DIR, { recursive: true });
     if (!existsSync(PRODUCTS_FILE)) writeFileSync(PRODUCTS_FILE, JSON.stringify({}, null, 4), "utf-8");
     if (!existsSync(STATS_FILE)) writeFileSync(STATS_FILE, JSON.stringify({ total_sold: 0 }, null, 4), "utf-8");
+    if (!existsSync(CATEGORIES_FILE)) writeFileSync(CATEGORIES_FILE, JSON.stringify({}, null, 4), "utf-8");
   }
 
   /** path ของไฟล์สต็อก (คืน null ถ้าชื่อมีตัวอักษรที่ใช้หลุดโฟลเดอร์ได้ เช่น / \ ..) */
@@ -135,7 +139,7 @@ class StockManager {
     return this.productsIO.run(() => atomicWrite(PRODUCTS_FILE, JSON.stringify(data, null, 4)));
   }
 
-  async createProduct(name, price) {
+  async createProduct(name, price, category = null) {
     return this.lock.run(async () => {
       const products = await this._loadProducts();
       const nameLower = name.toLowerCase();
@@ -143,11 +147,100 @@ class StockManager {
       if (!filepath) return { success: false, msg: "ชื่อสินค้าไม่ถูกต้อง (ห้ามมี / \\ หรือ ..)" };
       if (Object.hasOwn(products, nameLower)) return { success: false, msg: "สินค้ามีอยู่แล้ว" };
 
-      products[nameLower] = { name, price };
+      let categoryKey = null;
+      if (category) {
+        const categories = await this._loadCategories();
+        categoryKey = category.toLowerCase();
+        if (!Object.hasOwn(categories, categoryKey)) {
+          return { success: false, msg: `ไม่พบหมวดหมู่ '${category}' (สร้างก่อนด้วย /createcategory)` };
+        }
+        if (Object.values(products).filter((p) => p.category === categoryKey).length >= 24) {
+          return { success: false, msg: "หมวดนี้มีสินค้าครบ 24 รายการแล้ว (ข้อจำกัดของ Discord)" };
+        }
+      }
+
+      products[nameLower] = categoryKey ? { name, price, category: categoryKey } : { name, price };
       await this._saveProducts(products);
 
       await fs.writeFile(filepath, "", "utf-8");
-      return { success: true, msg: `สร้างสินค้า '${name}' เรียบร้อย` };
+      return { success: true, msg: `สร้างสินค้า '${name}' เรียบร้อย${categoryKey ? ` (หมวด: ${category})` : ""}` };
+    });
+  }
+
+  // ---- หมวดหมู่สินค้า (เก็บใน categories.json, สินค้าอ้างถึงหมวดด้วยฟิลด์ category) ----
+  async _loadCategories() {
+    return this.categoriesIO.run(async () => JSON.parse(stripBom(await fs.readFile(CATEGORIES_FILE, "utf-8"))));
+  }
+
+  async _saveCategories(data) {
+    return this.categoriesIO.run(() => atomicWrite(CATEGORIES_FILE, JSON.stringify(data, null, 4)));
+  }
+
+  async createCategory(name, emoji, description) {
+    return this.lock.run(async () => {
+      const categories = await this._loadCategories();
+      const key = name.toLowerCase();
+      if (key === UNCATEGORIZED_KEY) return { success: false, msg: "ชื่อหมวดหมู่นี้สงวนไว้ใช้ภายใน" };
+      if (Object.hasOwn(categories, key)) return { success: false, msg: "หมวดหมู่นี้มีอยู่แล้ว" };
+      // กันไว้ 1 ช่องสำหรับหมวด "อื่นๆ" (Discord จำกัด dropdown ไม่เกิน 25 ตัวเลือก)
+      if (Object.keys(categories).length >= 24) return { success: false, msg: "สร้างหมวดหมู่ได้สูงสุด 24 หมวด (ข้อจำกัดของ Discord)" };
+
+      categories[key] = { name, emoji: emoji || null, description: description || null };
+      await this._saveCategories(categories);
+      return { success: true, msg: `สร้างหมวดหมู่ '${name}' เรียบร้อย` };
+    });
+  }
+
+  async deleteCategory(name) {
+    return this.lock.run(async () => {
+      const categories = await this._loadCategories();
+      const key = name.toLowerCase();
+      if (!Object.hasOwn(categories, key)) return { success: false, msg: "ไม่พบหมวดหมู่" };
+
+      const categoryName = categories[key].name;
+      delete categories[key];
+      await this._saveCategories(categories);
+
+      // สินค้าในหมวดนี้กลายเป็น "ยังไม่จัดหมวด" (ไม่ลบสินค้าหรือสต็อก)
+      const products = await this._loadProducts();
+      let moved = 0;
+      for (const data of Object.values(products)) {
+        if (data.category === key) {
+          delete data.category;
+          moved++;
+        }
+      }
+      if (moved) await this._saveProducts(products);
+      return { success: true, msg: `ลบหมวดหมู่ '${categoryName}' แล้ว${moved ? ` — สินค้า ${moved} รายการย้ายไปหมวด "อื่นๆ"` : ""}` };
+    });
+  }
+
+  /** ย้ายสินค้าเข้าหมวด (category ว่าง = เอาออกจากหมวด) */
+  async setProductCategory(productName, category) {
+    return this.lock.run(async () => {
+      const products = await this._loadProducts();
+      const productKey = productName.toLowerCase();
+      if (!Object.hasOwn(products, productKey)) return { success: false, msg: "ไม่พบสินค้า" };
+      const product = products[productKey];
+
+      if (!category) {
+        delete product.category;
+        await this._saveProducts(products);
+        return { success: true, msg: `เอา '${product.name}' ออกจากหมวดหมู่แล้ว (จะแสดงในหมวด "อื่นๆ")` };
+      }
+
+      const categories = await this._loadCategories();
+      const categoryKey = category.toLowerCase();
+      if (!Object.hasOwn(categories, categoryKey)) return { success: false, msg: "ไม่พบหมวดหมู่" };
+
+      const inCategory = Object.values(products).filter((p) => p.category === categoryKey).length;
+      if (product.category !== categoryKey && inCategory >= 24) {
+        return { success: false, msg: "หมวดนี้มีสินค้าครบ 24 รายการแล้ว (ข้อจำกัดของ Discord)" };
+      }
+
+      product.category = categoryKey;
+      await this._saveProducts(products);
+      return { success: true, msg: `ย้าย '${product.name}' เข้าหมวด '${categories[categoryKey].name}' แล้ว` };
     });
   }
 
@@ -463,12 +556,73 @@ async function notifyOwnerInsufficientPayment(client, buyer, productName, quanti
 // ==========================================
 const SELECT_ID = "shop_select";
 const SELECT_ID_2 = "shop_select_2";
+const CATEGORY_SELECT_ID = "shop_category";
+const CATEGORY_SELECT_ID_2 = "shop_category_2";
+const CATEGORY_PRODUCT_PREFIX = "shop_catprod:"; // + id ข้อความแผงร้านค้า (ใช้รีเฟรชแผงหลังซื้อ)
 const CLEAR_SELECTION_ID = "shop_clear_selection";
 const RELOAD_ID = "reload_shop";
 const MODAL_PREFIX = "purchase:";
 
+/** แผงนี้เป็นชุดที่ 2 (/postshop2) หรือไม่ ดูจาก customId ของ dropdown */
+function panelVariant(message) {
+  const secondIds = [SELECT_ID_2, CATEGORY_SELECT_ID_2];
+  return message.components?.some((row) => row.components?.some((c) => secondIds.includes(c.customId))) ? "second" : "default";
+}
+
+const categoryLabel = (group) => (group.emoji ? `${group.emoji} ${group.name}` : group.name);
+
+/** รับอีโมจิเดี่ยว (ยูนิโค้ด หรืออีโมจิเซิร์ฟเวอร์ <:name:id>) — ค่าผิดรูปแบบจะทำให้ Discord ปฏิเสธทั้งแผง จึงต้องกรองก่อน */
+function normalizeEmoji(input) {
+  const text = input?.trim();
+  if (!text) return null;
+  if (/^<a?:\w{2,32}:\d{17,20}>$/.test(text)) return text;
+  if (/^[\p{Extended_Pictographic}\p{Regional_Indicator}\p{Emoji_Modifier}‍️⃣#*0-9]{1,16}$/u.test(text)
+      && /[\p{Extended_Pictographic}\p{Regional_Indicator}]/u.test(text)) return text;
+  return undefined; // undefined = รูปแบบไม่ถูกต้อง
+}
+
+/** จัดกลุ่มสินค้าตามหมวด (เรียงตามลำดับที่สร้างหมวด) สินค้าที่ไม่มีหมวดไปอยู่ "อื่นๆ" — คืนเฉพาะหมวดที่มีสินค้า */
+function groupByCategory(products, categories) {
+  const groups = Object.entries(categories).map(([key, c]) => ({ key, ...c, products: [] }));
+  const byKey = new Map(groups.map((g) => [g.key, g]));
+  const other = { key: UNCATEGORIZED_KEY, name: "อื่นๆ", emoji: "📦", description: null, products: [] };
+  for (const entry of Object.entries(products)) (byKey.get(entry[1].category) ?? other).products.push(entry);
+  return [...groups, other].filter((g) => g.products.length);
+}
+
+/** dropdown เลือกหมวดหมู่ (ใช้เมื่อสร้างหมวดหมู่ไว้อย่างน้อย 1 หมวด) */
+async function buildCategoryComponents(products, categories, stockManager, variant) {
+  const groups = groupByCategory(products, categories).slice(0, 24);
+  const options = await Promise.all(
+    groups.map(async (g) => {
+      const counts = await Promise.all(g.products.map(([key]) => stockManager.getStockCount(key)));
+      const stock = counts.reduce((a, b) => a + b, 0);
+      const desc = `${g.description ? `${g.description} | ` : ""}สินค้า ${g.products.length} รายการ | คงเหลือ ${stock} ชิ้น`;
+      const option = new StringSelectMenuOptionBuilder().setLabel(g.name.slice(0, 100)).setDescription(desc.slice(0, 100)).setValue(g.key);
+      if (g.emoji) option.setEmoji(g.emoji);
+      return option;
+    }),
+  );
+  options.push(
+    new StringSelectMenuOptionBuilder().setLabel("ล้างตัวเลือก").setDescription("ยกเลิกการเลือกหมวดหมู่").setValue(CLEAR_SELECTION_ID),
+  );
+  return [
+    new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId(variant === "second" ? CATEGORY_SELECT_ID_2 : CATEGORY_SELECT_ID)
+        .setPlaceholder("เลือกหมวดหมู่สินค้าที่นี่")
+        .setMinValues(1)
+        .setMaxValues(1)
+        .addOptions(options),
+    ),
+  ];
+}
+
 /** สร้างแผง dropdown เลือกสินค้า + ปุ่มรีเฟรช (เทียบเท่า build_shop_view) */
 async function buildShopComponents(products, stockManager, variant = "default") {
+  const categories = await stockManager._loadCategories();
+  if (Object.keys(categories).length) return buildCategoryComponents(products, categories, stockManager, variant);
+
   // กันไว้ 1 ช่องสำหรับตัวเลือก "ล้างตัวเลือก" (Discord จำกัดไม่เกิน 25 ตัวเลือก)
   const entries = Object.entries(products).slice(0, 24);
   const counts = await Promise.all(entries.map(([key]) => stockManager.getStockCount(key)));
@@ -501,22 +655,105 @@ async function buildShopComponents(products, stockManager, variant = "default") 
   return rows;
 }
 
+/** วาดแผงร้านค้าใหม่ (อัปเดตสต็อก/ยอดขาย และรีเซ็ต dropdown ที่ลูกค้าเลือกค้างไว้) */
+async function refreshPanelMessage(message) {
+  const variant = panelVariant(message);
+  const products = await stockManager._loadProducts();
+  const components = await buildShopComponents(products, stockManager, variant);
+  const totalSold = await stockManager.getTotalSold();
+  // แนบรูปแบนเนอร์เดิมไว้ให้อัตโนมัติ ตราบใดที่เราไม่ส่ง attachments ใหม่
+  await message.edit({ embeds: [makeShopEmbed(totalSold, variant)], components });
+}
+
 /** อัปเดตแผงร้านค้าเดิมหลังมีคนซื้อ (ทำเบื้องหลัง) */
 async function refreshShopEmbed(interaction) {
   try {
-    const message = interaction.isFromMessage?.() ? interaction.message : null;
+    let message = interaction.isFromMessage?.() ? interaction.message : null;
     if (!message) return;
-    const variant = message.components?.some((row) => row.components?.some((component) => component.customId === SELECT_ID_2))
-      ? "second"
-      : "default";
-    const products = await stockManager._loadProducts();
-    const components = await buildShopComponents(products, stockManager, variant);
-    const totalSold = await stockManager.getTotalSold();
-    // แนบรูปแบนเนอร์เดิมไว้ให้อัตโนมัติ ตราบใดที่เราไม่ส่ง attachments ใหม่
-    await message.edit({ embeds: [makeShopEmbed(totalSold, variant)], components });
+    // ซื้อจากเมนูสินค้าในหมวด (ข้อความเฉพาะตัว) → ไปรีเฟรชแผงร้านค้าหลักที่เมนูนั้นจดไว้แทน
+    const ref = message.components
+      ?.flatMap((row) => row.components ?? [])
+      .find((c) => c.customId?.startsWith(CATEGORY_PRODUCT_PREFIX));
+    if (ref) message = await interaction.channel.messages.fetch(ref.customId.slice(CATEGORY_PRODUCT_PREFIX.length).split(":")[0]);
+    await refreshPanelMessage(message);
   } catch (e) {
    //console.log(`Failed to refresh shop embed: ${e}`);
   }
+}
+
+/** เลือกหมวดหมู่จากแผงร้านค้า → ส่ง dropdown สินค้าในหมวดนั้นให้ลูกค้าเห็นคนเดียว */
+async function handleCategorySelect(interaction) {
+  const selectedValue = interaction.values[0];
+
+  if (selectedValue === CLEAR_SELECTION_ID) {
+    await interaction.deferUpdate();
+    return refreshPanelMessage(interaction.message);
+  }
+
+  const [products, categories] = await Promise.all([stockManager._loadProducts(), stockManager._loadCategories()]);
+  const group = groupByCategory(products, categories).find((g) => g.key === selectedValue);
+
+  if (!group) {
+    await interaction.reply({
+      embeds: [makeStatusEmbed("ไม่พบหมวดหมู่", "หมวดนี้อาจถูกลบหรือไม่มีสินค้าแล้ว กรุณาเลือกใหม่", "error")],
+      flags: EPHEMERAL,
+    });
+    return runBg(refreshPanelMessage(interaction.message));
+  }
+
+  await interaction.reply({ ...(await buildCategoryProductMenu(group, interaction.message.id)), flags: EPHEMERAL });
+
+  // รีเซ็ต dropdown หมวดหมู่บนแผง ลูกค้าจะได้กดหมวดเดิมซ้ำได้
+  runBg(refreshPanelMessage(interaction.message));
+}
+
+/** ข้อความ dropdown สินค้าในหมวด — customId จด id แผงร้านค้า (ไว้รีเฟรชหลังซื้อ) และหมวด (ไว้วาดใหม่ตอนล้างตัวเลือก) */
+async function buildCategoryProductMenu(group, panelMessageId) {
+  // กันไว้ 1 ช่องสำหรับตัวเลือก "ล้างตัวเลือก" (Discord จำกัดไม่เกิน 25 ตัวเลือก)
+  const entries = group.products.slice(0, 24);
+  const counts = await Promise.all(entries.map(([key]) => stockManager.getStockCount(key)));
+  const options = entries.map(([key, data], i) =>
+    new StringSelectMenuOptionBuilder()
+      .setLabel(String(data.name).slice(0, 100))
+      .setDescription(`ราคา: ${Number(data.price).toFixed(2)} บาท | คงเหลือ: ${counts[i]} ชิ้น`)
+      .setValue(key),
+  );
+  options.push(
+    new StringSelectMenuOptionBuilder()
+      .setLabel("ล้างตัวเลือก")
+      .setDescription("ยกเลิกการเลือกสินค้า เพื่อเลือกสินค้าใหม่")
+      .setValue(CLEAR_SELECTION_ID),
+  );
+
+  const embed = new EmbedBuilder()
+    .setTitle(categoryLabel(group).slice(0, 256))
+    .setDescription(group.description ?? "เลือกสินค้าที่ต้องการจากเมนูด้านล่าง")
+    .setColor(SHOP_COLOR);
+  const row = new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId(`${CATEGORY_PRODUCT_PREFIX}${panelMessageId}:${group.key}`.slice(0, 100))
+      .setPlaceholder("เลือกสินค้าที่นี่")
+      .setMinValues(1)
+      .setMaxValues(1)
+      .addOptions(options),
+  );
+  return { embeds: [embed], components: [row] };
+}
+
+/** ล้างตัวเลือกในเมนูสินค้าของหมวด → วาดเมนูเดิมใหม่ (สต็อกล่าสุด) ให้เลือกสินค้าใหม่ได้ */
+async function handleCategoryProductClear(interaction) {
+  const [panelMessageId, ...rest] = interaction.customId.slice(CATEGORY_PRODUCT_PREFIX.length).split(":");
+  const categoryKey = rest.join(":");
+  const [products, categories] = await Promise.all([stockManager._loadProducts(), stockManager._loadCategories()]);
+  const group = groupByCategory(products, categories).find((g) => g.key === categoryKey);
+
+  if (!group) {
+    return interaction.update({
+      embeds: [makeStatusEmbed("ไม่พบหมวดหมู่", "หมวดนี้อาจถูกลบหรือไม่มีสินค้าแล้ว กรุณาเลือกหมวดใหม่จากแผงร้านค้า", "error")],
+      components: [],
+    });
+  }
+  await interaction.update(await buildCategoryProductMenu(group, panelMessageId));
 }
 
 /** เลือกสินค้าจาก dropdown → เปิดหน้าต่างกรอกลิงก์ซอง (ต้องเปิด modal เป็น response แรก จึง defer ไม่ได้) */
@@ -524,6 +761,9 @@ async function handleProductSelect(interaction) {
   const selectedValue = interaction.values[0];
   const variant = interaction.customId === SELECT_ID_2 ? "second" : "default";
 
+  if (selectedValue === CLEAR_SELECTION_ID && interaction.customId.startsWith(CATEGORY_PRODUCT_PREFIX)) {
+    return handleCategoryProductClear(interaction);
+  }
   if (selectedValue === CLEAR_SELECTION_ID) {
     const products = await stockManager._loadProducts();
     const components = await buildShopComponents(products, stockManager, variant);
@@ -705,14 +945,7 @@ async function handlePurchaseSubmit(interaction) {
 async function handleReload(interaction) {
   await interaction.deferUpdate();
 
-  const variant = interaction.message.components?.some((row) => row.components?.some((component) => component.customId === SELECT_ID_2))
-    ? "second"
-    : "default";
-  const products = await stockManager._loadProducts();
-  const components = await buildShopComponents(products, stockManager, variant);
-  const totalSold = await stockManager.getTotalSold();
-
-  await interaction.message.edit({ embeds: [makeShopEmbed(totalSold, variant)], components });
+  await refreshPanelMessage(interaction.message);
   await interaction.followUp({
     embeds: [makeStatusEmbed("รีเฟรชสำเร็จ", "อัปเดตแผงร้านค้าและจำนวนสต็อกล่าสุดแล้ว", "success")],
     flags: EPHEMERAL,
@@ -735,13 +968,30 @@ const commands = [
     .setName("createproduct")
     .setDescription("[Admin] สร้างสินค้าใหม่")
     .addStringOption((o) => o.setName("name").setDescription("ชื่อสินค้า").setRequired(true))
-    .addNumberOption((o) => o.setName("price").setDescription("ราคา (บาท)").setRequired(true)),
+    .addNumberOption((o) => o.setName("price").setDescription("ราคา (บาท)").setRequired(true))
+    .addStringOption((o) => o.setName("category").setDescription("หมวดหมู่ (ไม่ใส่ = อื่นๆ)").setAutocomplete(true)),
   adminCommand()
     .setName("restock")
     .setDescription("[Admin] เติมสต็อกสินค้า")
-    .addStringOption((o) => o.setName("product").setDescription("ชื่อสินค้า").setRequired(true))
+    .addStringOption((o) => o.setName("product").setDescription("ชื่อสินค้า").setRequired(true).setAutocomplete(true))
     .addStringOption((o) => o.setName("text").setDescription("ข้อมูลสต็อก (หนึ่งบรรทัดต่อหนึ่งชิ้น)"))
     .addAttachmentOption((o) => o.setName("attachment").setDescription("ไฟล์ .txt (UTF-8) หนึ่งบรรทัดต่อหนึ่งชิ้น")),
+  adminCommand()
+    .setName("createcategory")
+    .setDescription("[Admin] สร้างหมวดหมู่สินค้า")
+    .addStringOption((o) => o.setName("name").setDescription("ชื่อหมวดหมู่").setRequired(true).setMaxLength(50))
+    .addStringOption((o) => o.setName("emoji").setDescription("อีโมจิหน้าชื่อหมวด เช่น 🎮").setMaxLength(64))
+    .addStringOption((o) => o.setName("description").setDescription("คำอธิบายสั้นๆ").setMaxLength(60)),
+  adminCommand()
+    .setName("deletecategory")
+    .setDescription("[Admin] ลบหมวดหมู่ (สินค้าในหมวดจะย้ายไป 'อื่นๆ' ไม่ถูกลบ)")
+    .addStringOption((o) => o.setName("category").setDescription("หมวดหมู่").setRequired(true).setAutocomplete(true)),
+  adminCommand()
+    .setName("setcategory")
+    .setDescription("[Admin] ย้ายสินค้าเข้าหมวดหมู่")
+    .addStringOption((o) => o.setName("product").setDescription("ชื่อสินค้า").setRequired(true).setAutocomplete(true))
+    .addStringOption((o) => o.setName("category").setDescription("หมวดหมู่ (ไม่ใส่ = เอาออกจากหมวด)").setAutocomplete(true)),
+  adminCommand().setName("categories").setDescription("[Admin] ดูหมวดหมู่และสินค้าในแต่ละหมวด"),
   adminCommand().setName("postshop").setDescription("[Admin] โพสต์แผงร้านค้าแบบ Dropdown"),
   adminCommand().setName("postshop2").setDescription("[Admin] โพสต์แผงร้านค้าชุดที่ 2 แบบ Dropdown"),
   adminCommand().setName("keypanel").setDescription("[Admin] โพสต์แผงจัดการ License Key ในช่องนี้"),
@@ -774,11 +1024,72 @@ export const commandHandlers = {
     await interaction.deferReply({ flags: EPHEMERAL }); // ตอบรับ Discord ภายใน 3 วิ แล้วค่อยทำงาน
     const name = interaction.options.getString("name", true);
     const price = interaction.options.getNumber("price", true);
-    const { success, msg } = await stockManager.createProduct(name, price);
+    const category = interaction.options.getString("category");
+    const { success, msg } = await stockManager.createProduct(name, price, category);
     await interaction.followUp({
       embeds: [makeStatusEmbed(success ? "สร้างสินค้า" : "เกิดข้อผิดพลาด", msg, success ? "success" : "error")],
       flags: EPHEMERAL,
     });
+  },
+
+  async createcategory(interaction) {
+    await interaction.deferReply({ flags: EPHEMERAL });
+    const name = interaction.options.getString("name", true).trim();
+    const emoji = normalizeEmoji(interaction.options.getString("emoji"));
+    const description = interaction.options.getString("description")?.trim();
+    if (!name || emoji === undefined) {
+      return interaction.followUp({
+        embeds: [makeStatusEmbed("ข้อมูลไม่ถูกต้อง", !name ? "กรุณาใส่ชื่อหมวดหมู่" : "อีโมจิต้องเป็นอีโมจิเดี่ยว เช่น 🎮 หรืออีโมจิของเซิร์ฟเวอร์", "error")],
+        flags: EPHEMERAL,
+      });
+    }
+    const { success, msg } = await stockManager.createCategory(name, emoji, description);
+    await interaction.followUp({
+      embeds: [
+        makeStatusEmbed(
+          success ? "สร้างหมวดหมู่" : "เกิดข้อผิดพลาด",
+          success ? `${msg}\nใช้ /setcategory หรือ /createproduct เพื่อใส่สินค้าเข้าหมวด แล้ว /postshop ใหม่ (หรือรอให้แผงรีเฟรชเองตอนมีคนกด)` : msg,
+          success ? "success" : "error",
+        ),
+      ],
+      flags: EPHEMERAL,
+    });
+  },
+
+  async deletecategory(interaction) {
+    await interaction.deferReply({ flags: EPHEMERAL });
+    const { success, msg } = await stockManager.deleteCategory(interaction.options.getString("category", true));
+    await interaction.followUp({
+      embeds: [makeStatusEmbed(success ? "ลบหมวดหมู่" : "เกิดข้อผิดพลาด", msg, success ? "success" : "error")],
+      flags: EPHEMERAL,
+    });
+  },
+
+  async setcategory(interaction) {
+    await interaction.deferReply({ flags: EPHEMERAL });
+    const { success, msg } = await stockManager.setProductCategory(
+      interaction.options.getString("product", true),
+      interaction.options.getString("category"),
+    );
+    await interaction.followUp({
+      embeds: [makeStatusEmbed(success ? "จัดหมวดหมู่" : "เกิดข้อผิดพลาด", msg, success ? "success" : "error")],
+      flags: EPHEMERAL,
+    });
+  },
+
+  async categories(interaction) {
+    await interaction.deferReply({ flags: EPHEMERAL });
+    const [products, categories] = await Promise.all([stockManager._loadProducts(), stockManager._loadCategories()]);
+    const groups = groupByCategory(products, categories);
+    const empty = Object.entries(categories).filter(([key]) => !groups.some((g) => g.key === key));
+
+    const lines = groups.map((g) => `**${categoryLabel(g)}** (${g.products.length})\n${g.products.map(([, p]) => `• ${p.name} — ${p.price}฿`).join("\n")}`);
+    for (const [, c] of empty) lines.push(`**${categoryLabel(c)}** (0) — ยังไม่มีสินค้า ไม่แสดงในร้าน`);
+    let text = lines.join("\n\n") || "ยังไม่มีสินค้าหรือหมวดหมู่";
+    if (text.length > 4000) text = `${text.slice(0, 3990)}\n…`;
+
+    const note = Object.keys(categories).length ? "" : "\n\n_ยังไม่มีหมวดหมู่ — แผงร้านค้าจะแสดงสินค้ารวมแบบเดิม_";
+    await interaction.followUp({ embeds: [makeStatusEmbed("หมวดหมู่สินค้า", text + note, "info")], flags: EPHEMERAL });
   },
 
   async restock(interaction) {
@@ -828,8 +1139,26 @@ export const commandHandlers = {
   ...licenseCommands,
 };
 
+/** ช่องพิมพ์ชื่อสินค้า/หมวดหมู่ในคำสั่งแอดมิน → แสดงรายการให้เลือก ไม่ต้องจำชื่อเอง */
+async function handleAutocomplete(interaction) {
+  if (!isAdmin(interaction.user.id)) return interaction.respond([]);
+  const focused = interaction.options.getFocused(true);
+  const query = focused.value.toLowerCase();
+  let names = [];
+  if (focused.name === "category") names = Object.values(await stockManager._loadCategories()).map((c) => c.name);
+  else if (focused.name === "product") names = Object.values(await stockManager._loadProducts()).map((p) => p.name);
+  const choices = names
+    .filter((n) => n.toLowerCase().includes(query))
+    .slice(0, 25)
+    .map((n) => ({ name: n.slice(0, 100), value: n.slice(0, 100) }));
+  await interaction.respond(choices);
+}
+
 /** ตัวกลางรับ interaction ทุกชนิด — ถ้าเกิด error จะแจ้งผู้ใช้แทนที่จะค้างที่ "กำลังคิด..." */
 export async function dispatchInteraction(interaction) {
+  if (interaction.isAutocomplete()) {
+    return handleAutocomplete(interaction).catch((err) => console.error("Autocomplete error:", err));
+  }
   try {
     if (interaction.isChatInputCommand()) {
       if (!interaction.inGuild() || !isAdmin(interaction.user.id)) {
@@ -842,7 +1171,12 @@ export async function dispatchInteraction(interaction) {
       if (handler) await handler(interaction);
     } else if (await handleLicenseInteraction(interaction)) {
       // ปุ่ม/ฟอร์มของแผงจัดการคีย์ (customId ขึ้นต้นด้วย "ak:")
-    } else if (interaction.isStringSelectMenu() && [SELECT_ID, SELECT_ID_2].includes(interaction.customId)) {
+    } else if (interaction.isStringSelectMenu() && [CATEGORY_SELECT_ID, CATEGORY_SELECT_ID_2].includes(interaction.customId)) {
+      await handleCategorySelect(interaction);
+    } else if (
+      interaction.isStringSelectMenu() &&
+      ([SELECT_ID, SELECT_ID_2].includes(interaction.customId) || interaction.customId.startsWith(CATEGORY_PRODUCT_PREFIX))
+    ) {
       await handleProductSelect(interaction);
     } else if (interaction.isButton() && interaction.customId === RELOAD_ID) {
       await handleReload(interaction);
