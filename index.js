@@ -167,6 +167,36 @@ class StockManager {
     });
   }
 
+  /** ลบสินค้า — สต็อกที่ยังไม่ได้ขายจะย้ายไปเก็บที่ stock/_deleted/ ไม่ได้ลบทิ้ง (กันลบผิดแล้วของหาย) */
+  async deleteProduct(name) {
+    return this.lock.run(async () => {
+      const products = await this._loadProducts();
+      const key = name.toLowerCase();
+      if (!Object.hasOwn(products, key)) return { success: false, msg: "ไม่พบสินค้า" };
+      const productName = products[key].name;
+
+      delete products[key];
+      await this._saveProducts(products);
+
+      const filepath = this._stockPath(key);
+      let remaining = 0;
+      let backup = null;
+      if (filepath && existsSync(filepath)) {
+        remaining = splitLines(await fs.readFile(filepath, "utf-8")).filter((l) => l.trim()).length;
+        if (remaining) {
+          const dir = path.join(STOCK_DIR, "_deleted");
+          await fs.mkdir(dir, { recursive: true });
+          backup = path.join(dir, `${path.basename(filepath, ".txt")}-${Date.now()}.txt`);
+          await fs.rename(filepath, backup);
+        } else {
+          await fs.rm(filepath, { force: true });
+        }
+      }
+      const stockMsg = remaining ? `\nสต็อกที่เหลือ ${remaining} ชิ้น ย้ายไปเก็บที่ \`${backup.replaceAll("\\", "/")}\`` : "";
+      return { success: true, msg: `ลบสินค้า '${productName}' แล้ว${stockMsg}` };
+    });
+  }
+
   // ---- หมวดหมู่สินค้า (เก็บใน categories.json, สินค้าอ้างถึงหมวดด้วยฟิลด์ category) ----
   async _loadCategories() {
     return this.categoriesIO.run(async () => JSON.parse(stripBom(await fs.readFile(CATEGORIES_FILE, "utf-8"))));
@@ -977,6 +1007,10 @@ const commands = [
     .addStringOption((o) => o.setName("text").setDescription("ข้อมูลสต็อก (หนึ่งบรรทัดต่อหนึ่งชิ้น)"))
     .addAttachmentOption((o) => o.setName("attachment").setDescription("ไฟล์ .txt (UTF-8) หนึ่งบรรทัดต่อหนึ่งชิ้น")),
   adminCommand()
+    .setName("deleteproduct")
+    .setDescription("[Admin] ลบสินค้า (สต็อกที่เหลือจะย้ายไปเก็บใน stock/_deleted)")
+    .addStringOption((o) => o.setName("product").setDescription("ชื่อสินค้า").setRequired(true).setAutocomplete(true)),
+  adminCommand()
     .setName("createcategory")
     .setDescription("[Admin] สร้างหมวดหมู่สินค้า")
     .addStringOption((o) => o.setName("name").setDescription("ชื่อหมวดหมู่").setRequired(true).setMaxLength(50))
@@ -1028,6 +1062,21 @@ export const commandHandlers = {
     const { success, msg } = await stockManager.createProduct(name, price, category);
     await interaction.followUp({
       embeds: [makeStatusEmbed(success ? "สร้างสินค้า" : "เกิดข้อผิดพลาด", msg, success ? "success" : "error")],
+      flags: EPHEMERAL,
+    });
+  },
+
+  async deleteproduct(interaction) {
+    await interaction.deferReply({ flags: EPHEMERAL });
+    const { success, msg } = await stockManager.deleteProduct(interaction.options.getString("product", true));
+    await interaction.followUp({
+      embeds: [
+        makeStatusEmbed(
+          success ? "ลบสินค้า" : "เกิดข้อผิดพลาด",
+          success ? `${msg}\nแผงร้านค้าจะอัปเดตเองเมื่อมีคนกด หรือโพสต์ใหม่ด้วย /postshop` : msg,
+          success ? "success" : "error",
+        ),
+      ],
       flags: EPHEMERAL,
     });
   },
