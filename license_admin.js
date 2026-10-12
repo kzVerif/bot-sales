@@ -1,6 +1,9 @@
 import "dotenv/config";
-import { existsSync, readFileSync } from "node:fs";
-import { randomInt } from "node:crypto";
+import { createWriteStream, existsSync, readFileSync } from "node:fs";
+import fs from "node:fs/promises";
+import { createHash, randomInt, randomUUID } from "node:crypto";
+import { once } from "node:events";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -38,6 +41,17 @@ const UPDATE_WEBHOOKS = splitList(process.env.RELEASE_WEBHOOKS_UPDATE);
 const DOWNLOAD_WEBHOOKS = splitList(process.env.RELEASE_WEBHOOKS_DOWNLOAD);
 const TEST_WEBHOOK = (process.env.RELEASE_TEST_WEBHOOK || "").trim(); // ตั้งไว้ = โหมดทดสอบส่งทุกข้อความไปห้องนี้ห้องเดียว
 const APP_NAME = process.env.RELEASE_APP_NAME || "Auto Post FB";
+
+// ---- ไฟล์อัปเดต: รับได้เฉพาะ release ใน repo นี้ (ห้ามเปิดให้ใส่ URL เอง — โปรแกรมลูกค้าติดตั้งทุกไฟล์ที่ hash ตรง) ----
+const RELEASE_REPO = "kzVerif/autopost-release";
+const assetName = (version) => `AutoPost-v${version}.zip`;
+// tag บน GitHub มีทั้งแบบ v1.3.3 และ 1.3.3 — ลิงก์ใช้ tag ที่เจอจริง
+const releaseUrl = (version, tag = `v${version}`) => `https://github.com/${RELEASE_REPO}/releases/download/${tag}/${assetName(version)}`;
+
+const GITHUB_TOKEN = (process.env.GITHUB_TOKEN || "").trim(); // ไม่บังคับ: token read-only ได้ 5,000 ครั้ง/ชม. (ไม่ใส่ = 60)
+const AUDIT_CHANNEL_ID = (process.env.ADMIN_LOG_CHANNEL_ID || "").trim(); // ช่องแอดมินสำหรับ audit log ทุกการเขียน app_info
+const SECRET_ZIP_FILES = new Set(["config.json", "license.key", "admin_secret.txt"]);
+const CONFIRM_TTL_MS = 5 * 60_000; // ปุ่มยืนยันหมดอายุใน 5 นาที
 
 const KEY_ALPHABET ="ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // ตัด 0/O/1/I ที่อ่านสับสน
 // แพ็กเกจ (ชื่อ/จำนวนบัญชี/ฟีเจอร์) อ่านจากตาราง plans ใน Supabase — แก้ที่ DB ได้เลยไม่ต้องแก้โค้ด
@@ -108,6 +122,12 @@ async function api(method, query, body, prefer) {
   const raw = await res.text();
   if (!res.ok) {
     const detail = raw.slice(0, 400);
+    if (res.status === 401 || res.status === 403) {
+      throw new AdminError("Supabase ปฏิเสธ — secret key ผิดหรือหมดอายุ (ตรวจ admin_secret.txt / SUPABASE_SECRET_KEY)");
+    }
+    if (/PGRST204|42703/.test(detail) && detail.includes("sha256")) {
+      throw new AdminError("ตาราง app_info ยังไม่มีคอลัมน์ sha256 — รัน schema.sql (หรือ supabase/auto_update.sql) ใน SQL Editor ก่อน");
+    }
     // PGRST205 = ไม่มีตาราง, 42703/PGRST204 = ไม่มีคอลัมน์ → ฐานข้อมูลยังเป็นโครงสร้างเก่า
     if (/PGRST205|PGRST204|42703/.test(detail)) {
       throw new AdminError("โครงสร้างฐานข้อมูลไม่ตรงกับบอท — รันไฟล์ schema.sql ใน Supabase SQL Editor ก่อน");
@@ -241,6 +261,200 @@ function compareVersion(a, b) {
   return 0;
 }
 
+/** สิ่งที่ลูกค้าเห็นจริง (ผ่านฟังก์ชัน get_app_info) — คืน null ถ้าเรียกไม่ได้ */
+async function getPublicAppInfo() {
+  try {
+    return await api("POST", "rpc/get_app_info", {});
+  } catch {
+    return null;
+  }
+}
+
+/** โปรแกรมลูกค้า (1.3.2 ขึ้นไป) จะแสดงปุ่ม "อัปเดตตอนนี้" ก็ต่อเมื่อเงื่อนไขนี้ผ่าน */
+const canAutoUpdate = (info) => /^https:\/\//.test(info.download_url || "") && /^[0-9a-f]{64}$/.test(info.sha256 || "");
+
+// ==========================================
+// 2b. ตรวจไฟล์ release บน GitHub (ขั้น 3–5 ในคู่มือระบบอัปเดต)
+// ==========================================
+/** หา asset AutoPost-v<เวอร์ชัน>.zip ใน release tag v<เวอร์ชัน> (ไม่เจอค่อยลอง tag <เวอร์ชัน> ไม่มี v) — คืน { asset, tag } */
+async function findReleaseAsset(version) {
+  const headers = {
+    Accept: "application/vnd.github+json",
+    "User-Agent": "autopost-fb-admin-bot/1.0",
+    "X-GitHub-Api-Version": "2022-11-28",
+  };
+  if (GITHUB_TOKEN) headers.Authorization = `Bearer ${GITHUB_TOKEN}`;
+
+  for (const tag of [`v${version}`, version]) {
+    let res;
+    try {
+      res = await fetch(`https://api.github.com/repos/${RELEASE_REPO}/releases/tags/${tag}`, {
+        headers,
+        signal: AbortSignal.timeout(20_000),
+      });
+    } catch (err) {
+      throw new AdminError(`เชื่อมต่อ GitHub ไม่ได้: ${err.message}`);
+    }
+    if (res.status === 404) continue;
+    if (res.status === 403 || res.status === 429) {
+      throw new AdminError("GitHub จำกัดจำนวนครั้งที่เรียก — รอสักครู่ หรือใส่ GITHUB_TOKEN (read-only) ใน .env");
+    }
+    if (!res.ok) throw new AdminError(`GitHub ตอบกลับ HTTP ${res.status}`);
+
+    const release = await res.json();
+    const asset = release.assets?.find((a) => a.name === assetName(version));
+    if (!asset) throw new AdminError(`release ${tag} ไม่มีไฟล์ ${assetName(version)}`);
+    if (asset.browser_download_url !== releaseUrl(version, tag)) {
+      throw new AdminError(`ลิงก์ไฟล์ไม่ตรงรูปแบบที่กำหนด (${asset.browser_download_url})`);
+    }
+    return { asset, tag };
+  }
+  throw new AdminError(`ยังไม่มี release v${version} (หรือ ${version}) ใน ${RELEASE_REPO} — ให้ dev อัปโหลดก่อน`);
+}
+
+/** โหลด asset ลงไฟล์ชั่วคราวพร้อมคำนวณ SHA-256 — ผู้เรียกต้องลบ tmp เอง */
+async function downloadAsset(asset) {
+  const failed = (why) => new AdminError(`โหลดไฟล์ไม่ครบ — ลองใหม่ หรืออัปโหลดไฟล์ใหม่ทับ (${why})`);
+  const tmp = path.join(os.tmpdir(), `autopost-release-${randomUUID()}.zip`);
+  const hash = createHash("sha256");
+  let bytes = 0;
+  const out = createWriteStream(tmp);
+  try {
+    const res = await fetch(asset.browser_download_url, { redirect: "follow", signal: AbortSignal.timeout(10 * 60_000) });
+    if (!res.ok) throw failed(`HTTP ${res.status}`);
+    for await (const chunk of res.body) {
+      hash.update(chunk);
+      bytes += chunk.length;
+      if (!out.write(chunk)) await once(out, "drain");
+    }
+    out.end();
+    await once(out, "finish");
+  } catch (err) {
+    out.destroy();
+    await fs.rm(tmp, { force: true });
+    throw err instanceof AdminError ? err : failed(err.message);
+  }
+  if (bytes !== asset.size) {
+    await fs.rm(tmp, { force: true });
+    throw failed(`ได้ ${bytes} จาก ${asset.size} ไบต์`);
+  }
+  return { tmp, sha256: hash.digest("hex"), bytes };
+}
+
+/** รายชื่อไฟล์ใน zip (อ่าน central directory เอง รองรับ ZIP64 — ไม่ต้องลงไลบรารีเพิ่ม) */
+async function listZipEntries(file) {
+  const bad = () => new AdminError("ไฟล์ zip เสียหายหรือไม่ใช่ zip");
+  const fh = await fs.open(file, "r");
+  try {
+    const { size } = await fh.stat();
+    const tailLen = Math.min(size, 22 + 65535 + 20); // EOCD + comment ยาวสุด + ZIP64 locator
+    const tail = Buffer.alloc(tailLen);
+    await fh.read(tail, 0, tailLen, size - tailLen);
+
+    let eocd = -1;
+    for (let i = tailLen - 22; i >= 0; i--) {
+      if (tail.readUInt32LE(i) === 0x06054b50) {
+        eocd = i;
+        break;
+      }
+    }
+    if (eocd < 0) throw bad();
+    let count = tail.readUInt16LE(eocd + 10);
+    let cdSize = tail.readUInt32LE(eocd + 12);
+    let cdOffset = tail.readUInt32LE(eocd + 16);
+
+    if (count === 0xffff || cdSize === 0xffffffff || cdOffset === 0xffffffff) {
+      const loc = eocd - 20;
+      if (loc < 0 || tail.readUInt32LE(loc) !== 0x07064b50) throw bad();
+      const z64 = Buffer.alloc(56);
+      await fh.read(z64, 0, 56, Number(tail.readBigUInt64LE(loc + 8)));
+      if (z64.readUInt32LE(0) !== 0x06064b50) throw bad();
+      count = Number(z64.readBigUInt64LE(32));
+      cdSize = Number(z64.readBigUInt64LE(40));
+      cdOffset = Number(z64.readBigUInt64LE(48));
+    }
+    if (cdOffset + cdSize > size) throw bad();
+
+    const cd = Buffer.alloc(cdSize);
+    await fh.read(cd, 0, cdSize, cdOffset);
+    const names = [];
+    let p = 0;
+    for (let i = 0; i < count; i++) {
+      if (p + 46 > cd.length || cd.readUInt32LE(p) !== 0x02014b50) throw bad();
+      const utf8 = cd.readUInt16LE(p + 8) & 0x800;
+      const nameLen = cd.readUInt16LE(p + 28);
+      const extraLen = cd.readUInt16LE(p + 30);
+      const commentLen = cd.readUInt16LE(p + 32);
+      names.push(cd.subarray(p + 46, p + 46 + nameLen).toString(utf8 ? "utf8" : "latin1"));
+      p += 46 + nameLen + extraLen + commentLen;
+    }
+    return names;
+  } finally {
+    await fh.close();
+  }
+}
+
+/** ตรวจว่าเป็นชุดจาก build.py และไม่มีไฟล์ลับ/path อันตราย (โปรแกรมลูกค้าจะปฏิเสธ zip ที่ไม่มี exe/_internal) */
+function checkZipEntries(names) {
+  const paths = names.map((n) => n.replaceAll("\\", "/"));
+  const unsafe = paths.find((n) => n.startsWith("/") || /^[a-zA-Z]:/.test(n) || n.split("/").includes(".."));
+  if (unsafe) throw new AdminError(`zip มี path อันตราย (${unsafe}) — ห้ามปล่อย ให้ build ใหม่`);
+  const secret = paths.find((n) => SECRET_ZIP_FILES.has(n.split("/").pop().toLowerCase()));
+  if (secret) throw new AdminError(`พบไฟล์ลับในไฟล์ (${secret}) — ห้ามปล่อย ให้ลบ release นี้ทันที`);
+  if (!paths.includes("AutoPost/AutoPost.exe") || !paths.some((n) => n.startsWith("AutoPost/_internal/"))) {
+    throw new AdminError("ไฟล์ไม่ใช่ชุดจาก build.py (ไม่มี AutoPost/AutoPost.exe หรือ AutoPost/_internal/) — ลูกค้าจะอัปเดตไม่ได้");
+  }
+}
+
+// ==========================================
+// 2c. หน้ายืนยันก่อนเขียน app_info (กดได้เฉพาะคนสั่ง, หมดอายุ 5 นาที)
+// ==========================================
+const pendingWrites = new Map();
+
+function addPending(userId, action) {
+  const now = Date.now();
+  for (const [id, p] of pendingWrites) if (p.expires < now) pendingWrites.delete(id);
+  const id = randomUUID().replaceAll("-", "").slice(0, 16);
+  pendingWrites.set(id, { ...action, userId, expires: now + CONFIRM_TTL_MS });
+  return id;
+}
+
+/** ดึงงานที่รอยืนยัน — ต้องเรียกก่อน defer เพราะ error ตอบกลับเป็นข้อความใหม่ */
+function getPending(interaction, id) {
+  const p = pendingWrites.get(id);
+  if (!p || p.expires < Date.now()) {
+    pendingWrites.delete(id);
+    throw new AdminError("หน้ายืนยันนี้หมดอายุแล้ว — เริ่มใหม่อีกครั้ง (ยังไม่ได้เขียนอะไร)");
+  }
+  if (p.userId !== interaction.user.id) throw new AdminError("ปุ่มนี้กดได้เฉพาะคนที่สั่งเท่านั้น");
+  return p;
+}
+
+/** โพสต์ audit log ลงช่องแอดมิน: ใคร, เมื่อไหร่, ค่าเดิม → ค่าใหม่ (ไว้คืนค่าเมื่อกดผิด) */
+async function auditLog(interaction, title, before, after) {
+  if (!AUDIT_CHANNEL_ID) return "⚠️ ยังไม่ได้ตั้ง ADMIN_LOG_CHANNEL_ID ใน .env — ไม่ได้บันทึก audit log";
+  const show = (v) => truncate(v == null ? "null" : String(v), 300).replaceAll("`", "ˋ");
+  const changes = Object.keys(after)
+    .filter((k) => k !== "updated_at" && (before[k] ?? null) !== (after[k] ?? null))
+    .map((k) => `**${k}**\n\`${show(before[k])}\` ➜ \`${show(after[k])}\``);
+  try {
+    const channel = await interaction.client.channels.fetch(AUDIT_CHANNEL_ID);
+    const embed = new EmbedBuilder()
+      .setTitle(`📝 ${title}`)
+      .setColor(COLORS.muted)
+      .setDescription(truncate(changes.join("\n\n") || "ไม่มีค่าที่เปลี่ยน", 4000))
+      .addFields(
+        { name: "โดย", value: `<@${interaction.user.id}> (\`${interaction.user.tag ?? interaction.user.id}\`)`, inline: true },
+        { name: "เวลา", value: fmtTs(new Date()), inline: true },
+      )
+      .setTimestamp();
+    await channel.send({ embeds: [embed], allowedMentions: { parse: [] } });
+    return "📝 บันทึก audit log แล้ว";
+  } catch (err) {
+    return `⚠️ บันทึก audit log ไม่สำเร็จ: ${err.message}`;
+  }
+}
+
 // ==========================================
 // 3. Release webhooks
 // ==========================================
@@ -272,7 +486,7 @@ function releaseEmbeds(release, downloadChannelId, test) {
         "",
         force
           ? "> 🔴 **บังคับอัปเดต**\n> เวอร์ชันเก่าจะกดเริ่มทำงานไม่ได้จนกว่าจะอัปเดต"
-          : "> 🟢 **มีเวอร์ชันใหม่พร้อมให้อัปเดตแล้ว**\n> อัปเดตเพื่อใช้ฟีเจอร์ล่าสุดและการแก้ไขข้อผิดพลาด",
+          : "> 🟢 **มีเวอร์ชันใหม่พร้อมให้อัปเดตแล้ว**\n> กด \"อัปเดตตอนนี้\" ในโปรแกรมได้เลย (เวอร์ชัน 1.3.2 ขึ้นไป)",
         "",
         "### 📝 มีอะไรเปลี่ยนบ้าง",
         formatNotes(notes),
@@ -296,9 +510,9 @@ function releaseEmbeds(release, downloadChannelId, test) {
         downloadLink,
         "",
         "### 🛠️ วิธีอัปเดต",
-        "`1` ดาวน์โหลดไฟล์ zip จากปุ่มด้านล่าง",
-        "`2` แตกไฟล์ zip",
-        "`3` เปิดโปรแกรมเวอร์ชันใหม่ได้เลย",
+        "`1` เปิดโปรแกรม จะมีแถบแจ้งเวอร์ชันใหม่ (ภายใน 30 นาที หรือปิดแล้วเปิดโปรแกรมใหม่)",
+        "`2` กด **อัปเดตตอนนี้** โปรแกรมจะโหลด ตรวจไฟล์ และติดตั้งให้เอง (ถ้ามีงานกำลังทำงานให้กดหยุดก่อน)",
+        "`3` ใช้เวอร์ชันต่ำกว่า 1.3.2 หรืออัปเดตในโปรแกรมไม่ได้: กดปุ่มดาวน์โหลดด้านล่าง แล้วแตกไฟล์ทับของเดิม",
         "",
         "### 📝 มีอะไรใหม่",
         formatNotes(notes),
@@ -562,19 +776,32 @@ function listView(rows, plans, page, showAll) {
   return { embeds: [embed], components };
 }
 
-function appView(info, notice) {
+/** หน้า อัปเดต / ประกาศ — publicInfo = ผลจาก get_app_info (สิ่งที่ลูกค้าเห็นจริง) ไว้เตือนถ้าฟังก์ชันยังไม่คืน sha256 */
+function appView(info, notice, publicInfo) {
   const level = LEVELS[info.announcement_level] ?? info.announcement_level;
+  const warnings = [];
+  if (publicInfo && !Object.hasOwn(publicInfo, "sha256")) {
+    warnings.push("⚠️ get_app_info ยังไม่คืน sha256 — ลูกค้าจะอัปเดตในโปรแกรมไม่ได้ รัน schema.sql ใน SQL Editor");
+  }
+  if (publicInfo === null) warnings.push("⚠️ เรียก get_app_info ไม่ได้ — ลูกค้าอาจไม่เห็นข้อมูลอัปเดต");
+  const autoUpdate = canAutoUpdate(info)
+    ? `✅ ได้ (SHA-256 \`${info.sha256.slice(0, 12)}…\`)`
+    : "❌ ไม่ได้ — ลูกค้าต้องกดดาวน์โหลดเอง (ไม่มี sha256)";
+  const description = [notice, ...warnings].filter(Boolean).join("\n\n");
+
   const embed = new EmbedBuilder()
     .setTitle(`📢 อัปเดต / ประกาศ${RELEASE_TEST_MODE ? "  ·  🧪 โหมดทดสอบปล่อยเวอร์ชัน" : ""}`)
-    .setDescription(truncate(notice || "", 4000) || null)
+    .setDescription(truncate(description, 4000) || null)
     .setColor(RELEASE_TEST_MODE ? COLORS.warning : COLORS.info)
     .addFields(
       { name: "เวอร์ชันล่าสุด", value: String(info.latest_version), inline: true },
       { name: "ขั้นต่ำที่ใช้ได้", value: `${info.min_version} (ต่ำกว่านี้ = บังคับอัปเดต)`, inline: true },
+      { name: "อัปเดตในโปรแกรม", value: autoUpdate, inline: true },
       { name: "ลิงก์ดาวน์โหลด", value: info.download_url || "-" },
       { name: "สิ่งที่เปลี่ยน", value: truncate(info.changelog || "-", 1024) },
       { name: "ประกาศ", value: info.announcement ? truncate(`${info.announcement}  [${level}]`, 1024) : "-" },
-    );
+    )
+    .setFooter({ text: `แก้ล่าสุด ${info.updated_at ? new Date(info.updated_at).toLocaleString("th-TH") : "-"} · ลูกค้าเห็นภายใน 30 นาที` });
   const row = new ActionRowBuilder().addComponents(
     button("ak:rel", RELEASE_TEST_MODE ? "ทดสอบปล่อยเวอร์ชัน" : "ปล่อยเวอร์ชันใหม่", ButtonStyle.Success, RELEASE_TEST_MODE ? "🧪" : "🚀"),
     button("ak:ann", "ประกาศ", ButtonStyle.Primary, "📣"),
@@ -582,6 +809,74 @@ function appView(info, notice) {
     button("ak:app", "รีเฟรช", ButtonStyle.Secondary, "🔄"),
   );
   return { embeds: [embed], components: [row] };
+}
+
+async function loadAppView(notice) {
+  const [info, publicInfo] = await Promise.all([getAppInfo(), getPublicAppInfo()]);
+  return appView(info, notice, publicInfo);
+}
+
+/** หน้ายืนยันก่อนเขียน app_info — งานบังคับอัปเดตต้องยืนยัน 2 ชั้น */
+function confirmView(id, p) {
+  const expires = `<t:${Math.floor(p.expires / 1000)}:R>`;
+  const footer = { text: `กดได้เฉพาะคนที่สั่ง${RELEASE_TEST_MODE && p.kind === "release" ? " · 🧪 โหมดทดสอบ: จะไม่บันทึกลง DB" : ""}` };
+  let embed;
+  let confirmLabel = "ยืนยัน";
+  let danger = false;
+
+  if (p.kind === "release") {
+    danger = p.force;
+    const secondStep = p.force && p.forceAsked;
+    embed = new EmbedBuilder()
+      .setTitle(secondStep ? "⚠️ ยืนยันบังคับอัปเดตอีกครั้ง" : `🚀 ยืนยันปล่อยเวอร์ชัน v${p.version}`)
+      .setColor(p.force ? COLORS.error : COLORS.success)
+      .setDescription(
+        [
+          secondStep
+            ? `ลูกค้าทุกคนที่ต่ำกว่า **v${p.version}** จะใช้งานไม่ได้จนกว่าจะอัปเดต\nถ้าเวอร์ชันใหม่มีบั๊ก ลูกค้าจะใช้งานไม่ได้ทั้งเวอร์ชันเก่าและใหม่`
+            : `ตรวจไฟล์บน GitHub ผ่านแล้ว — ยังไม่ได้เขียนอะไรลง Supabase`,
+          `หมดอายุ ${expires}`,
+        ].join("\n"),
+      )
+      .addFields(
+        { name: "เวอร์ชัน", value: `\`v${p.previous}\` ➜ \`v${p.version}\``, inline: true },
+        { name: "ขนาด", value: `${(p.bytes / 1024 / 1024).toFixed(1)} MB`, inline: true },
+        { name: "SHA-256", value: `\`${p.sha256.slice(0, 12)}…\``, inline: true },
+        { name: "บังคับอัปเดต", value: p.force ? "🔴 ใช่ (ตั้ง min_version = เวอร์ชันนี้)" : "ไม่", inline: true },
+        { name: "ไฟล์", value: `[${assetName(p.version)}](${releaseUrl(p.version, p.tag)})`, inline: true },
+        { name: "สิ่งที่เปลี่ยน", value: truncate(p.notes || "-", 1024) },
+      );
+    confirmLabel = p.force ? (secondStep ? "ยืนยันบังคับอัปเดต" : "ถัดไป") : "ยืนยันปล่อยเวอร์ชัน";
+  } else if (p.kind === "announce") {
+    embed = new EmbedBuilder()
+      .setTitle("📣 ยืนยันประกาศถึงลูกค้าทุกคน")
+      .setColor(COLORS.warning)
+      .setDescription(`แสดงเป็นแถบบนสุดในโปรแกรม (ลูกค้าเห็นภายใน 30 นาที)\nหมดอายุ ${expires}`)
+      .addFields(
+        { name: "ระดับ", value: `${p.level} (${LEVELS[p.level]})`, inline: true },
+        { name: "ข้อความ", value: truncate(p.text, 1024) },
+      );
+  } else {
+    embed = new EmbedBuilder()
+      .setTitle("🗑️ ยืนยันลบประกาศ")
+      .setColor(COLORS.warning)
+      .setDescription(`ลูกค้าจะไม่เห็นแถบประกาศอีก\nหมดอายุ ${expires}`);
+    danger = true;
+  }
+  embed.setFooter(footer);
+  const row = new ActionRowBuilder().addComponents(
+    button(`ak:cfm:${id}`, confirmLabel, danger ? ButtonStyle.Danger : ButtonStyle.Success, "✅"),
+    button(`ak:cxl:${id}`, "ยกเลิก", ButtonStyle.Secondary, "✖️"),
+  );
+  return { embeds: [embed], components: [row] };
+}
+
+/** หน้าแจ้งว่าปล่อยเวอร์ชันไม่ผ่าน (ยังไม่เขียน Supabase) พร้อมปุ่มกลับ */
+function releaseFailedView(message) {
+  return {
+    embeds: [statusEmbed("ปล่อยเวอร์ชันไม่สำเร็จ", `${message}\n\nยังไม่ได้เขียนอะไรลง Supabase`, "error")],
+    components: [new ActionRowBuilder().addComponents(button("ak:app", "กลับหน้าอัปเดต", ButtonStyle.Secondary, "↩️"))],
+  };
 }
 
 function modal(id, title, inputs) {
@@ -744,44 +1039,116 @@ async function handleFeatureSelect(interaction, key) {
   await interaction.editReply(keyView(row, plans, notice));
 }
 
-async function handleAppModal(interaction, id) {
-  await interaction.deferUpdate();
-  let info;
-  let notice;
-  if (id === "ak:relm") {
-    const version = field(interaction, "version");
-    const url = field(interaction, "url");
-    const force = /^(y|yes|ใช่|1|true)$/i.test(field(interaction, "force"));
+/** ขั้น 1–5 ของ release: ตรวจเลข → เทียบกับ app_info → หาไฟล์บน GitHub → โหลด+คำนวณ SHA-256 → ตรวจ zip → หน้ายืนยัน
+ *  (ผู้เรียก defer ไว้แล้ว) ข้อไหนไม่ผ่าน = หยุดทันที ยังไม่เขียนอะไรลง Supabase */
+async function prepareRelease(interaction, { version, notes, force }) {
+  try {
+    version = version.trim().replace(/^v/i, "");
+    if (!/^\d+\.\d+\.\d+$/.test(version)) throw new AdminError("เลขเวอร์ชันผิดรูปแบบ — ใส่เลขแบบ 1.3.3");
     const current = await getAppInfo();
     if (compareVersion(version, current.latest_version) < 0) {
-      throw new AdminError(`${version} เก่ากว่าเวอร์ชันล่าสุดที่ประกาศไว้ (${current.latest_version})`);
+      throw new AdminError(`${version} เก่ากว่าเวอร์ชันที่ประกาศไว้ (${current.latest_version}) — ห้ามถอยเลข ให้ release เลขที่สูงกว่า`);
     }
-    if (!/^https?:\/\//.test(url)) throw new AdminError("ลิงก์ต้องขึ้นต้นด้วย https://");
-    const notes = field(interaction, "notes") || null;
-    const release = { version, previous: current.latest_version, url, notes, force };
+
+    await interaction.editReply({
+      embeds: [statusEmbed("กำลังตรวจไฟล์", `กำลังโหลด ${assetName(version)} จาก GitHub เพื่อคำนวณ SHA-256 และตรวจข้างใน zip (ไฟล์ราว 50 MB อาจใช้เวลาสักครู่)…`)],
+      components: [],
+    });
+    const { asset, tag } = await findReleaseAsset(version);
+    const { tmp, sha256, bytes } = await downloadAsset(asset);
+    try {
+      checkZipEntries(await listZipEntries(tmp));
+    } finally {
+      await fs.rm(tmp, { force: true });
+    }
+
+    const action = { kind: "release", version, tag, previous: current.latest_version, notes: notes || null, force, sha256, bytes };
+    const id = addPending(interaction.user.id, action);
+    await interaction.editReply(confirmView(id, pendingWrites.get(id)));
+  } catch (err) {
+    if (!(err instanceof AdminError)) throw err;
+    await interaction.editReply(releaseFailedView(err.message));
+  }
+}
+
+function prepareAnnounce(interaction, text, levelText) {
+  const level = (levelText || "info").trim().toLowerCase();
+  if (!(level in LEVELS)) throw new AdminError("ระดับต้องเป็น info / warn / critical");
+  if (!text.trim()) throw new AdminError("กรุณาใส่ข้อความประกาศ");
+  const id = addPending(interaction.user.id, { kind: "announce", text: text.trim(), level });
+  return confirmView(id, pendingWrites.get(id));
+}
+
+function prepareAnnounceClear(interaction) {
+  const id = addPending(interaction.user.id, { kind: "announce_clear" });
+  return confirmView(id, pendingWrites.get(id));
+}
+
+/** กดยืนยันแล้ว → เขียน app_info ด้วย PATCH ครั้งเดียว → audit log → ประกาศในช่องลูกค้า */
+async function executePending(interaction, p) {
+  const before = await getAppInfo();
+  let info = before;
+  let fields;
+  let notice;
+
+  if (p.kind === "release") {
+    // เผื่อมีคนปล่อยเวอร์ชันสูงกว่าตัดหน้าระหว่างรอยืนยัน
+    if (compareVersion(p.version, before.latest_version) < 0) {
+      throw new AdminError(`${p.version} เก่ากว่าเวอร์ชันที่ประกาศไว้ (${before.latest_version}) แล้ว — ยกเลิกการปล่อย`);
+    }
+    fields = { latest_version: p.version, download_url: releaseUrl(p.version, p.tag), sha256: p.sha256, changelog: p.notes };
+    if (p.force) fields.min_version = p.version;
+    const release = { version: p.version, previous: before.latest_version, url: releaseUrl(p.version, p.tag), notes: p.notes, force: p.force };
 
     if (RELEASE_TEST_MODE) {
-      info = current; // โหมดทดสอบ: ไม่บันทึกลง DB
-      notice = `🧪 **โหมดทดสอบ** — ส่งแจ้งเตือน v${version} แล้ว แต่ยังไม่ได้บันทึกลง DB (โปรแกรมลูกค้าไม่เปลี่ยน)`;
+      notice = `🧪 **โหมดทดสอบ** — ไฟล์ผ่านการตรวจ (SHA-256 \`${p.sha256.slice(0, 12)}…\`) ส่งแจ้งเตือน v${p.version} แล้ว แต่ยังไม่ได้บันทึกลง DB`;
     } else {
-      const fields = { latest_version: version, download_url: url, changelog: notes };
-      if (force) fields.min_version = version;
       info = await updateAppInfo(fields);
-      notice = `🚀 ประกาศเวอร์ชัน ${version} แล้ว — โปรแกรมลูกค้าจะเห็นภายใน 30 นาที` +
-        (force ? "\nเวอร์ชันเก่าจะกดเริ่มทำงานไม่ได้จนกว่าจะอัปเดต" : "");
+      notice =
+        `🚀 ปล่อยเวอร์ชัน ${p.version} แล้ว — ลูกค้าจะเห็นภายใน 30 นาที และกด "อัปเดตตอนนี้" ได้ (เวอร์ชัน 1.3.2 ขึ้นไป)` +
+        (p.force ? "\n🔴 เวอร์ชันเก่าจะใช้งานไม่ได้จนกว่าจะอัปเดต" : "");
+      notice += `\n${await auditLog(interaction, `ปล่อยเวอร์ชัน v${p.version}${p.force ? " (บังคับอัปเดต)" : ""}`, before, info)}`;
     }
     notice += `\n\n**แจ้งเตือนห้อง Discord**\n${(await announceRelease(release, RELEASE_TEST_MODE)).join("\n")}`;
+  } else if (p.kind === "announce") {
+    // announcement_at ต้องใหม่ทุกครั้ง ไม่งั้นลูกค้าที่เคยกดซ่อนประกาศก่อนหน้าจะไม่เห็น
+    fields = { announcement: p.text, announcement_level: p.level, announcement_at: new Date().toISOString() };
+    info = await updateAppInfo(fields);
+    notice = `📣 ประกาศแล้ว — โปรแกรมลูกค้าจะเห็นภายใน 30 นาที\n${await auditLog(interaction, "ตั้งประกาศในโปรแกรม", before, info)}`;
   } else {
-    const level = (field(interaction, "level") || "info").toLowerCase();
-    if (!(level in LEVELS)) throw new AdminError("ระดับต้องเป็น info / warn / critical");
-    info = await updateAppInfo({
-      announcement: field(interaction, "text"),
-      announcement_level: level,
-      announcement_at: new Date().toISOString(),
-    });
-    notice = "📣 ประกาศแล้ว — โปรแกรมลูกค้าจะเห็นภายใน 30 นาที";
+    fields = { announcement: null, announcement_at: null };
+    info = await updateAppInfo(fields);
+    notice = `🗑️ ลบประกาศแล้ว\n${await auditLog(interaction, "ลบประกาศในโปรแกรม", before, info)}`;
   }
-  await interaction.editReply(appView(info, notice));
+  await interaction.editReply(appView(info, notice, await getPublicAppInfo()));
+}
+
+async function handleConfirm(interaction, id) {
+  const p = getPending(interaction, id);
+  if (p.kind === "release" && p.force && !p.forceAsked) {
+    p.forceAsked = true; // บังคับอัปเดต = ถามยืนยันอีกชั้น
+    return interaction.update(confirmView(id, p));
+  }
+  pendingWrites.delete(id); // กดซ้ำไม่ได้
+  await interaction.deferUpdate();
+  try {
+    await executePending(interaction, p);
+  } catch (err) {
+    if (!(err instanceof AdminError)) throw err;
+    await interaction.editReply(releaseFailedView(err.message));
+  }
+}
+
+async function handleAppModal(interaction, id) {
+  await interaction.deferUpdate();
+  if (id === "ak:relm") {
+    return prepareRelease(interaction, {
+      version: field(interaction, "version"),
+      notes: field(interaction, "notes"),
+      force: /^(y|yes|ใช่|1|true)$/i.test(field(interaction, "force")),
+    });
+  }
+  await interaction.editReply(prepareAnnounce(interaction, field(interaction, "text"), field(interaction, "level")));
 }
 
 async function handleButton(interaction) {
@@ -819,18 +1186,23 @@ async function handleButton(interaction) {
     }
     case "appopen":
       await interaction.deferReply({ flags: EPHEMERAL });
-      return interaction.editReply(appView(await getAppInfo()));
+      return interaction.editReply(await loadAppView());
     case "app":
       await interaction.deferUpdate();
-      return interaction.editReply(appView(await getAppInfo()));
+      return interaction.editReply(await loadAppView());
     case "annclr":
+      return interaction.update(prepareAnnounceClear(interaction));
+    case "cfm":
+      return handleConfirm(interaction, rest[0]);
+    case "cxl":
+      getPending(interaction, rest[0]);
+      pendingWrites.delete(rest[0]);
       await interaction.deferUpdate();
-      return interaction.editReply(appView(await updateAppInfo({ announcement: null, announcement_at: null }), "🗑️ ลบประกาศแล้ว"));
+      return interaction.editReply(await loadAppView("✖️ ยกเลิกแล้ว — ยังไม่ได้เขียนอะไรลง Supabase"));
     case "rel":
       return interaction.showModal(
         modal("ak:relm", RELEASE_TEST_MODE ? "ทดสอบปล่อยเวอร์ชัน (ไม่บันทึก DB)" : "ปล่อยเวอร์ชันใหม่", [
-          { id: "version", label: "เลขเวอร์ชัน (ตรงกับ version.py ตัวที่ build)", placeholder: "1.0.1", max: 20 },
-          { id: "url", label: "ลิงก์ดาวน์โหลดไฟล์ zip", placeholder: "https://...", max: 500 },
+          { id: "version", label: "เลขเวอร์ชัน (ต้องมี release บน GitHub แล้ว)", placeholder: "1.3.3", max: 20 },
           { id: "notes", label: "สิ่งที่เปลี่ยนในเวอร์ชันนี้", required: false, long: true, max: 1000 },
           { id: "force", label: "บังคับอัปเดต? (ใช่ / ไม่)", value: "ไม่", max: 5 },
         ]),
@@ -886,6 +1258,30 @@ export const licenseCommands = {
   async keypanel(interaction) {
     await interaction.reply({ content: "โพสต์แผงจัดการ License Key แล้ว ✅", flags: EPHEMERAL });
     await interaction.channel.send(panelMessage());
+  },
+
+  // ---- ระบบอัปเดตโปรแกรม (ทำแบบเดียวกับปุ่มในแผง "อัปเดต / ประกาศ") ----
+  async "app-info"(interaction) {
+    await interaction.deferReply({ flags: EPHEMERAL });
+    await interaction.editReply(await loadAppView());
+  },
+
+  async release(interaction) {
+    await interaction.deferReply({ flags: EPHEMERAL }); // ต้องโหลดไฟล์ ~50 MB เกิน 3 วิแน่นอน
+    await prepareRelease(interaction, {
+      version: interaction.options.getString("version", true),
+      notes: interaction.options.getString("notes")?.replaceAll("\\n", "\n").trim(),
+      force: interaction.options.getBoolean("force") ?? false,
+    });
+  },
+
+  async announce(interaction) {
+    const view = prepareAnnounce(interaction, interaction.options.getString("text", true), interaction.options.getString("level"));
+    await interaction.reply({ ...view, flags: EPHEMERAL });
+  },
+
+  async "announce-clear"(interaction) {
+    await interaction.reply({ ...prepareAnnounceClear(interaction), flags: EPHEMERAL });
   },
 
   async key(interaction) {

@@ -205,6 +205,14 @@ create table if not exists public.app_info (
 
 insert into public.app_info (id) values (1) on conflict (id) do nothing;
 
+-- อัปเดตในโปรแกรม (เทียบเท่า supabase/auto_update.sql): SHA-256 ของ zip ที่ bot คำนวณจากไฟล์บน GitHub
+-- มีค่า = ลูกค้า (1.3.2 ขึ้นไป) กด "อัปเดตตอนนี้" ได้, null = ลูกค้าโหลดเอง
+alter table public.app_info add column if not exists sha256 text;
+do $$ begin
+  alter table public.app_info add constraint app_info_sha256_check check (sha256 ~ '^[0-9a-f]{64}$');
+exception when duplicate_object then null;
+end $$;
+
 alter table public.app_info enable row level security;
 revoke all on table public.app_info from anon, authenticated;
 
@@ -219,6 +227,7 @@ as $$
     'latest_version',     latest_version,
     'min_version',        min_version,
     'download_url',       download_url,
+    'sha256',             sha256,
     'changelog',          changelog,
     'announcement',       announcement,
     'announcement_level', announcement_level,

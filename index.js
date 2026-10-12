@@ -1029,6 +1029,24 @@ const commands = [
   adminCommand().setName("postshop").setDescription("[Admin] โพสต์แผงร้านค้าแบบ Dropdown"),
   adminCommand().setName("postshop2").setDescription("[Admin] โพสต์แผงร้านค้าชุดที่ 2 แบบ Dropdown"),
   adminCommand().setName("keypanel").setDescription("[Admin] โพสต์แผงจัดการ License Key ในช่องนี้"),
+  adminCommand().setName("app-info").setDescription("[Admin] ดูเวอร์ชันล่าสุด / ขั้นต่ำ / ลิงก์ / ประกาศ ที่ลูกค้าเห็น"),
+  adminCommand()
+    .setName("release")
+    .setDescription("[Admin] ปล่อยเวอร์ชันใหม่จาก GitHub release (ตรวจไฟล์ + SHA-256 ให้เอง)")
+    .addStringOption((o) => o.setName("version").setDescription("เลขเวอร์ชัน เช่น 1.3.3 (ต้องมี release v1.3.3 บน GitHub แล้ว)").setRequired(true).setMaxLength(20))
+    .addStringOption((o) => o.setName("notes").setDescription("สิ่งที่เปลี่ยน (ขึ้นบรรทัดใหม่ด้วย \\n)").setMaxLength(1000))
+    .addBooleanOption((o) => o.setName("force").setDescription("บังคับอัปเดต (เวอร์ชันเก่าใช้งานไม่ได้)")),
+  adminCommand()
+    .setName("announce")
+    .setDescription("[Admin] ตั้งประกาศเป็นแถบบนสุดในโปรแกรมลูกค้า")
+    .addStringOption((o) => o.setName("text").setDescription("ข้อความประกาศ").setRequired(true).setMaxLength(1000))
+    .addStringOption((o) =>
+      o
+        .setName("level")
+        .setDescription("ระดับ (ค่าเริ่มต้น info)")
+        .addChoices({ name: "info (ฟ้า)", value: "info" }, { name: "warn (ส้ม)", value: "warn" }, { name: "critical (แดง)", value: "critical" }),
+    ),
+  adminCommand().setName("announce-clear").setDescription("[Admin] ลบประกาศในโปรแกรมลูกค้า"),
   adminCommand()
     .setName("key")
     .setDescription("[Admin] เปิดหน้าจัดการ License Key")
