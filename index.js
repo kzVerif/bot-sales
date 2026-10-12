@@ -1037,6 +1037,9 @@ const commands = [
     .addStringOption((o) => o.setName("notes").setDescription("สิ่งที่เปลี่ยน (ขึ้นบรรทัดใหม่ด้วย \\n)").setMaxLength(1000))
     .addBooleanOption((o) => o.setName("force").setDescription("บังคับอัปเดต (เวอร์ชันเก่าใช้งานไม่ได้)")),
   adminCommand()
+    .setName("release-notify")
+    .setDescription("[Admin] ส่งแจ้งเตือนเวอร์ชันล่าสุดไปห้องอัปเดต/ห้องโหลดอีกรอบ (เช่นรอบก่อนส่งไม่สำเร็จ)"),
+  adminCommand()
     .setName("announce")
     .setDescription("[Admin] ตั้งประกาศเป็นแถบบนสุดในโปรแกรมลูกค้า")
     .addStringOption((o) => o.setName("text").setDescription("ข้อความประกาศ").setRequired(true).setMaxLength(1000))

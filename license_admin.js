@@ -482,7 +482,7 @@ function releaseEmbeds(release, downloadChannelId, test) {
       [
         ...testLine,
         `## 🚀 อัปเดตใหม่ v${version}`,
-        `-# \`v${previous}\` ➜ \`v${version}\` · <t:${now}:D>`,
+        previous ? `-# \`v${previous}\` ➜ \`v${version}\` · <t:${now}:D>` : `-# \`v${version}\` · <t:${now}:D>`,
         "",
         force
           ? "> 🔴 **บังคับอัปเดต**\n> เวอร์ชันเก่าจะกดเริ่มทำงานไม่ได้จนกว่าจะอัปเดต"
@@ -568,22 +568,29 @@ async function sendWebhook(url, payload) {
   }
 }
 
-/** ส่งแจ้งเตือนเวอร์ชันใหม่ไปทุกห้อง — คืนรายงานผลทีละห้อง */
-async function announceRelease(release, test) {
-  const rooms = [
+/** รอบแจ้งเตือนล่าสุด { release, failed: [url ห้องที่ส่งไม่สำเร็จ] } — ไว้ส่งซ้ำ (หายเมื่อรีสตาร์ทบอท) */
+let lastAnnounce = null;
+
+/** ส่งแจ้งเตือนเวอร์ชันใหม่ไปทุกห้อง (onlyUrls = ส่งเฉพาะห้องเหล่านี้) — คืนรายงานผลทีละห้อง */
+async function announceRelease(release, test, onlyUrls = null) {
+  const allRooms = [
     ...UPDATE_WEBHOOKS.map((url, i) => ({ kind: "update", label: `แจ้งอัปเดต #${i + 1}`, url })),
     ...DOWNLOAD_WEBHOOKS.map((url, i) => ({ kind: "download", label: `ห้องโหลด #${i + 1}`, url })),
   ];
-  if (!rooms.length) return ["⚠️ ยังไม่ได้ตั้ง RELEASE_WEBHOOKS_UPDATE / RELEASE_WEBHOOKS_DOWNLOAD ใน .env — ไม่ได้ส่งแจ้งเตือน"];
+  if (!allRooms.length) return ["⚠️ ยังไม่ได้ตั้ง RELEASE_WEBHOOKS_UPDATE / RELEASE_WEBHOOKS_DOWNLOAD ใน .env — ไม่ได้ส่งแจ้งเตือน"];
+  const rooms = onlyUrls ? allRooms.filter((r) => onlyUrls.includes(r.url)) : allRooms;
+  if (!rooms.length) return ["⚠️ ไม่มีห้องที่ต้องส่งซ้ำ"];
 
   // ห้องแจ้งอัปเดตจะแท็กห้องโหลดที่อยู่เซิร์ฟเวอร์เดียวกันเท่านั้น (แท็กข้ามเซิร์ฟ คนที่ไม่ได้อยู่จะเห็นเป็น #unknown)
   // เซิร์ฟไหนไม่มีห้องโหลด = ใส่ลิงก์ดาวน์โหลดตรงแทน
-  const infos = await Promise.all(rooms.map((room) => webhookInfo(room.url)));
-  rooms.forEach((room, i) => Object.assign(room, { guildId: infos[i].guild_id, channelId: infos[i].channel_id }));
+  // หาจากทุกห้อง (ไม่ใช่แค่ห้องที่ส่งรอบนี้) ตอนส่งซ้ำเฉพาะห้องอัปเดตจะได้แท็กห้องโหลดถูก
+  const infos = await Promise.all(allRooms.map((room) => webhookInfo(room.url)));
+  allRooms.forEach((room, i) => Object.assign(room, { guildId: infos[i].guild_id, channelId: infos[i].channel_id }));
   const downloadChannelIn = (guildId) =>
-    guildId ? rooms.find((r) => r.kind === "download" && r.guildId === guildId)?.channelId ?? null : null;
+    guildId ? allRooms.find((r) => r.kind === "download" && r.guildId === guildId)?.channelId ?? null : null;
 
-  return Promise.all(
+  const failed = [];
+  const lines = await Promise.all(
     rooms.map(async (room) => {
       try {
         const { update, download, buttons } = releaseEmbeds(release, downloadChannelIn(room.guildId), test);
@@ -593,10 +600,14 @@ async function announceRelease(release, test) {
         await sendWebhook(target, payload);
         return `✅ ${room.label}${target === room.url ? "" : " (ส่งไปห้องทดสอบ)"}`;
       } catch (err) {
+        failed.push(room.url);
         return `❌ ${room.label} — ${err.message}`;
       }
     }),
   );
+  lastAnnounce = { release, failed };
+  if (failed.length) lines.push("↪️ กด **📨 แจ้งเตือนซ้ำ** ในหน้าอัปเดต (หรือ /release-notify) เพื่อส่งซ้ำเฉพาะห้องที่ล้มเหลว");
+  return lines;
 }
 
 // ==========================================
@@ -806,6 +817,7 @@ function appView(info, notice, publicInfo) {
     button("ak:rel", RELEASE_TEST_MODE ? "ทดสอบปล่อยเวอร์ชัน" : "ปล่อยเวอร์ชันใหม่", ButtonStyle.Success, RELEASE_TEST_MODE ? "🧪" : "🚀"),
     button("ak:ann", "ประกาศ", ButtonStyle.Primary, "📣"),
     button("ak:annclr", "ลบประกาศ", ButtonStyle.Danger, "🗑️").setDisabled(!info.announcement),
+    button("ak:resend", "แจ้งเตือนซ้ำ", ButtonStyle.Secondary, "📨"),
     button("ak:app", "รีเฟรช", ButtonStyle.Secondary, "🔄"),
   );
   return { embeds: [embed], components: [row] };
@@ -818,6 +830,7 @@ async function loadAppView(notice) {
 
 /** หน้ายืนยันก่อนเขียน app_info — งานบังคับอัปเดตต้องยืนยัน 2 ชั้น */
 function confirmView(id, p) {
+  if (p.kind === "resend") return resendConfirmView(id, p);
   const expires = `<t:${Math.floor(p.expires / 1000)}:R>`;
   const footer = { text: `กดได้เฉพาะคนที่สั่ง${RELEASE_TEST_MODE && p.kind === "release" ? " · 🧪 โหมดทดสอบ: จะไม่บันทึกลง DB" : ""}` };
   let embed;
@@ -869,6 +882,34 @@ function confirmView(id, p) {
     button(`ak:cxl:${id}`, "ยกเลิก", ButtonStyle.Secondary, "✖️"),
   );
   return { embeds: [embed], components: [row] };
+}
+
+/** หน้ายืนยันแจ้งเตือนซ้ำ — เลือกส่งทุกห้อง หรือเฉพาะห้องที่รอบก่อนส่งไม่สำเร็จ */
+function resendConfirmView(id, p) {
+  const r = p.release;
+  const test = RELEASE_TEST_MODE;
+  const embed = new EmbedBuilder()
+    .setTitle(`📨 แจ้งเตือนซ้ำ v${r.version}`)
+    .setColor(COLORS.warning)
+    .setDescription(
+      [
+        `ส่งประกาศเวอร์ชันนี้ไปห้องแจ้งอัปเดต (${UPDATE_WEBHOOKS.length} ห้อง) และห้องโหลด (${DOWNLOAD_WEBHOOKS.length} ห้อง) อีกรอบ`,
+        p.failed.length
+          ? `รอบก่อนส่งไม่สำเร็จ **${p.failed.length} ห้อง** — เลือก "เฉพาะห้องที่ล้มเหลว" กันห้องอื่นได้ข้อความซ้ำ`
+          : "รอบก่อนไม่มีห้องที่ล้มเหลว (หรือบอทรีสตาร์ทไปแล้ว) — ห้องที่เคยได้รับแล้วจะได้ข้อความซ้ำ",
+        `หมดอายุ <t:${Math.floor(p.expires / 1000)}:R>`,
+      ].join("\n"),
+    )
+    .addFields(
+      { name: "เวอร์ชัน", value: r.previous ? `\`v${r.previous}\` ➜ \`v${r.version}\`` : `\`v${r.version}\``, inline: true },
+      { name: "ประเภท", value: r.force ? "🔴 บังคับอัปเดต" : "🟢 แนะนำให้อัปเดต", inline: true },
+      { name: "ลิงก์", value: r.url },
+    )
+    .setFooter({ text: `กดได้เฉพาะคนที่สั่ง${test ? " · 🧪 โหมดทดสอบ: ส่งเป็นข้อความทดสอบ" : ""}` });
+  const buttons = [button(`ak:cfm:${id}`, "ส่งทุกห้อง", ButtonStyle.Primary, "📨")];
+  if (p.failed.length) buttons.push(button(`ak:cfmf:${id}`, `เฉพาะห้องที่ล้มเหลว (${p.failed.length})`, ButtonStyle.Success, "↪️"));
+  buttons.push(button(`ak:cxl:${id}`, "ยกเลิก", ButtonStyle.Secondary, "✖️"));
+  return { embeds: [embed], components: [new ActionRowBuilder().addComponents(buttons)] };
 }
 
 /** หน้าแจ้งว่าปล่อยเวอร์ชันไม่ผ่าน (ยังไม่เขียน Supabase) พร้อมปุ่มกลับ */
@@ -1086,6 +1127,12 @@ function prepareAnnounceClear(interaction) {
 
 /** กดยืนยันแล้ว → เขียน app_info ด้วย PATCH ครั้งเดียว → audit log → ประกาศในช่องลูกค้า */
 async function executePending(interaction, p) {
+  if (p.kind === "resend") {
+    // แจ้งเตือนซ้ำไม่เขียน app_info — แค่ส่ง webhook
+    const lines = await announceRelease(p.release, RELEASE_TEST_MODE, p.onlyFailed ? p.failed : null);
+    const scope = p.onlyFailed ? "เฉพาะห้องที่ล้มเหลว" : "ทุกห้อง";
+    return interaction.editReply(await loadAppView(`📨 แจ้งเตือนซ้ำ v${p.release.version} (${scope})\n${lines.join("\n")}`));
+  }
   const before = await getAppInfo();
   let info = before;
   let fields;
@@ -1123,8 +1170,31 @@ async function executePending(interaction, p) {
   await interaction.editReply(appView(info, notice, await getPublicAppInfo()));
 }
 
-async function handleConfirm(interaction, id) {
+/** เวอร์ชันที่จะแจ้งเตือนซ้ำ: รอบล่าสุดที่จำไว้ (รู้เวอร์ชันก่อนหน้า + ใช้ได้ในโหมดทดสอบที่ไม่บันทึก DB) ถ้ายังเป็นตัวล่าสุด
+ *  ไม่งั้น (เช่นรีสตาร์ทบอทแล้ว) สร้างจาก app_info */
+async function prepareResend(interaction) {
+  const info = await getAppInfo();
+  let release;
+  let failed = [];
+  if (lastAnnounce && compareVersion(lastAnnounce.release.version, info.latest_version) >= 0) {
+    ({ release, failed } = lastAnnounce);
+  } else {
+    if (!info.download_url) throw new AdminError("ยังไม่มีเวอร์ชันที่ปล่อยไว้ใน app_info — ไม่มีอะไรให้แจ้งเตือนซ้ำ");
+    release = {
+      version: info.latest_version,
+      previous: null,
+      url: info.download_url,
+      notes: info.changelog,
+      force: compareVersion(info.min_version, info.latest_version) >= 0,
+    };
+  }
+  const id = addPending(interaction.user.id, { kind: "resend", release, failed });
+  return confirmView(id, pendingWrites.get(id));
+}
+
+async function handleConfirm(interaction, id, { onlyFailed = false } = {}) {
   const p = getPending(interaction, id);
+  if (p.kind === "resend") p.onlyFailed = onlyFailed;
   if (p.kind === "release" && p.force && !p.forceAsked) {
     p.forceAsked = true; // บังคับอัปเดต = ถามยืนยันอีกชั้น
     return interaction.update(confirmView(id, p));
@@ -1194,6 +1264,16 @@ async function handleButton(interaction) {
       return interaction.update(prepareAnnounceClear(interaction));
     case "cfm":
       return handleConfirm(interaction, rest[0]);
+    case "cfmf":
+      return handleConfirm(interaction, rest[0], { onlyFailed: true });
+    case "resend":
+      await interaction.deferUpdate();
+      try {
+        return await interaction.editReply(await prepareResend(interaction));
+      } catch (err) {
+        if (!(err instanceof AdminError)) throw err;
+        return interaction.editReply(await loadAppView(`❌ ${err.message}`));
+      }
     case "cxl":
       getPending(interaction, rest[0]);
       pendingWrites.delete(rest[0]);
@@ -1273,6 +1353,11 @@ export const licenseCommands = {
       notes: interaction.options.getString("notes")?.replaceAll("\\n", "\n").trim(),
       force: interaction.options.getBoolean("force") ?? false,
     });
+  },
+
+  async "release-notify"(interaction) {
+    await interaction.deferReply({ flags: EPHEMERAL });
+    await interaction.editReply(await prepareResend(interaction));
   },
 
   async announce(interaction) {
